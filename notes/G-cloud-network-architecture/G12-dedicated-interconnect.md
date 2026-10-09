@@ -979,7 +979,7 @@ resource "azurerm_express_route_circuit_peering" "private" {
 - [G13 Managed global WAN](G13-managed-global-wan.md) (Cloud WAN, Virtual WAN, SiteLink / Global Reach comparisons)
 - [G4 Network performance and optimization](G4-network-performance-and-optimization.md) (MTU overlap: F6.1, G4.1, G12.27, H5.8)
 - [F7 Network routing](../F-network-engineering/F7-network-routing.md) (BGP path selection)
-- [F6 Network performance](../F-network-engineering/F6-network-performance.md#f61) (MTU)
+- [F6 Network performance](../F-network-engineering/F6-network-performance.md#f61-mss-vs-mtu-vs-pmtud) (MTU)
 - [H2 Troubleshooting your network](../H-full-stack-troubleshooting/H2-troubleshooting-your-network.md) (L1–L4 method used in G12.30)
 - [H1 Linux network diagnostics](../H-full-stack-troubleshooting/H1-linux-network-diagnostics.md) (ping -M do, mtr, tcpdump on BGP/179)
 - [H5 Network performance deep dive](../H-full-stack-troubleshooting/H5-network-performance-deep-dive.md) (MTU overlap H5.8)

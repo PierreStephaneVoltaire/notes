@@ -49,7 +49,7 @@
   - More runnable threads than cores → more involuntary switches, cache thrash, lock convoys. Size thread pools ≈ cores for CPU-bound work.
   - Mitigations: CPU pinning (`taskset`, k8s **CPU Manager `static` policy** for Guaranteed pods with integer CPUs), `isolcpus`/`nohz_full` for latency-critical, batching, event loops (epoll) instead of thread-per-connection, huge pages to reduce TLB misses.
 - **Interview angles:**
-  - "Why is thread-per-connection bad at 10k connections?" → memory per stack + scheduler/context-switch overhead + cache pollution; use epoll/io_uring event loops (nginx, Envoy, Redis) — see [A7](./A7-sockets.md) (A7.1).
+  - "Why is thread-per-connection bad at 10k connections?" → memory per stack + scheduler/context-switch overhead + cache pollution; use epoll/io_uring event loops (nginx, Envoy, Redis) — see [A7](./A7-socket-management.md) (A7.1).
   - "High `cs` in vmstat, what do you check?" → `pidstat -w` per task, voluntary (lock/IO waits) vs nonvoluntary (CPU oversubscription or cgroup throttling).
   - Follow-up: "Does a context switch always flush the TLB?" → No: not on same-mm thread switch, and not with PCID; kernel mappings are global.
 
@@ -207,7 +207,7 @@ CMD ["/usr/local/bin/app"]
 - [A2 The Anatomy of a Process](./A2-the-anatomy-of-a-process.md) (A2.1 program vs process, stack/heap)
 - [A3 Memory Management](./A3-memory-management.md) (A3.3 virtual memory, page tables, TLB; A3.5 RSS/shared)
 - [A4 Inside the CPU](./A4-inside-the-cpu.md) (A4.3 SMT, A4.4 IO-bound vs CPU-bound)
-- [A7 Sockets](./A7-sockets.md) (A7.1 kernel queues; epoll vs thread per connection)
+- [A7 Sockets](./A7-socket-management.md) (A7.1 kernel queues; epoll vs thread per connection)
 - `../B-database-engineering/` (B7 locking and concurrency); `../C-large-scale-architecture/` (C1.20–C1.24 concurrency and locking)
 - `../H-full-stack-troubleshooting/` (H1/H2 Linux diagnostic tools)
 

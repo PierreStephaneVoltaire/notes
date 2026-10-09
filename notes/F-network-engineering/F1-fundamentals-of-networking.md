@@ -188,7 +188,7 @@ sequenceDiagram
     participant GW as "Gateway 10.0.1.1"
     participant B as "Host B 10.0.2.20/24"
     Note over A: "10.0.2.20 AND mask is not 10.0.1.0, so use the default route"
-    A->>GW: "ARP who-has 10.0.1.1 (broadcast; in cloud answered by hypervisor)"
+    A->>GW: "ARP who-has 10.0.1.1 (broadcast, in cloud answered by hypervisor)"
     GW-->>A: "ARP reply with gateway MAC"
     A->>GW: "Frame dst MAC = GW, packet dst IP = 10.0.2.20, TTL 64"
     Note over GW: "LPM lookup, TTL to 63, new L2 header"

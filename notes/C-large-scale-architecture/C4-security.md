@@ -664,7 +664,7 @@ sequenceDiagram
     A->>D: Fetch Argon2id hash + salt
     A->>A: Constant-time verify, rate limit, MFA
     A->>R: SET sess:RANDOM128 {uid, roles, mfa} EX 1800
-    A->>B: "Set-Cookie: __Host-sid=RANDOM128; HttpOnly; Secure; SameSite=Lax"
+    A->>B: "Set-Cookie: __Host-sid=RANDOM128, HttpOnly, Secure, SameSite=Lax"
     B->>A: GET /orders + cookie
     A->>R: GET sess:RANDOM128
     R-->>A: session or nil
@@ -697,7 +697,7 @@ sequenceDiagram
     C->>AS: POST /token code + code_verifier + client auth (private_key_jwt)
     AS->>AS: Verify S256(verifier) == challenge, exact redirect_uri
     AS-->>C: access_token (JWT, aud=api), id_token, refresh_token
-    C->>U: "Set-Cookie: __Host-sid; HttpOnly; Secure; SameSite=Lax (tokens stay server-side)"
+    C->>U: "Set-Cookie: __Host-sid, HttpOnly, Secure, SameSite=Lax (tokens stay server-side)"
     U->>C: GET /bff/api/orders + cookie + CSRF header
     C->>API: GET /orders, Authorization: Bearer access_token
     API->>API: Verify sig via cached JWKS (kid), iss, aud, exp, scope, then object-level AuthZ

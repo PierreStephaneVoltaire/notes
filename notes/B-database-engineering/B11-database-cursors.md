@@ -132,14 +132,14 @@ sequenceDiagram
     PG-->>App: ALL rows (buffered in app RAM)
     Note over PG: server stateless, conn returned to pool
     Note over App,PG: Server-side cursor
-    App->>Pool: BEGIN; DECLARE c CURSOR FOR SELECT ...
+    App->>Pool: BEGIN, DECLARE c CURSOR FOR SELECT ...
     Pool->>PG: pins server conn for txn
     loop until no rows
         App->>PG: FETCH 2000 FROM c
         PG-->>App: batch of 2000 rows
     end
     Note over PG: snapshot held, xmin horizon pinned, VACUUM blocked
-    App->>PG: CLOSE c; COMMIT
+    App->>PG: CLOSE c, COMMIT
     Note over Pool: conn released. WITH HOLD would break here
 ```
 

@@ -103,7 +103,7 @@ sequenceDiagram
     participant S as "Server (delayed ACK)"
     C->>S: "write #1: HTTP header (sent, nothing in flight)"
     Note over C: "write #2: body held by Nagle (header unACKed)"
-    Note over S: "needs body to respond; nothing to piggyback; delayed-ACK timer 40-200 ms"
+    Note over S: "needs body to respond, nothing to piggyback, delayed-ACK timer 40-200 ms"
     S-->>C: "ACK (after timer)"
     C->>S: "body finally sent"
     S->>C: "response"

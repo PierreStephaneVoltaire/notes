@@ -154,7 +154,7 @@
     - Client-side query and connect timeouts below the HTTP timeout.
   - **Bound result sets.** Mandatory limits, plus keyset pagination (`WHERE id > $last ORDER BY id LIMIT $n`) instead of large `OFFSET`s. Reject unbounded `?limit=`. Return a cursor token, not raw offsets.
   - **Map errors.** Don't return raw DB errors (they leak schema and SQLSTATE). Log them with a correlation ID. Translate unique violations (`23505`) to 409, serialization failures (`40001`) to retry or 409, and timeouts (`57014`) to 503/504.
-  - **Idempotency and transactions.** Use idempotency keys for POST (a unique constraint plus `INSERT ... ON CONFLICT`). Keep transactions short and never hold one across network calls to other services. See [B7](B7-database-concurrency-control.md) for isolation.
+  - **Idempotency and transactions.** Use idempotency keys for POST (a unique constraint plus `INSERT ... ON CONFLICT`). Keep transactions short and never hold one across network calls to other services. See [B7](B7-concurrency-control.md) for isolation.
   - **Secrets.** No DB passwords in code or images. Use IAM/Entra tokens, or a secrets manager with rotation (cloud mapping below and [L6](../L-data-privacy-ai-security/L6-secrets-supply-chain.md)).
   - **Network.** Keep the DB on private subnets or a private endpoint with SG/NSG allowing only the app tier ([G7](../G-cloud-network-architecture/G7-service-endpoints-private-link.md)). There should be no public IP.
 - **Trade-offs / when to use:**
@@ -375,7 +375,7 @@ resource "azurerm_postgresql_flexible_server_configuration" "pgbouncer" {
 ---
 
 ## Cross-links
-- [B7 Concurrency Control](B7-database-concurrency-control.md): transaction isolation and locking behind API idempotency.
+- [B7 Concurrency Control](B7-concurrency-control.md): transaction isolation and locking behind API idempotency.
 - [B8 Database Replication](B8-database-replication.md): read pools on replicas.
 - [B11 Database Cursors](B11-database-cursors.md): Execute row limits and portals in the extended protocol.
 - [B13 Homomorphic Encryption](B13-homomorphic-encryption.md): encryption *in use* vs in transit and at rest.

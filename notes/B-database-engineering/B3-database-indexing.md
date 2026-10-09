@@ -290,7 +290,7 @@ flowchart LR
   - Narrow, because it is copied into every secondary index.
   - Unique, otherwise SQL Server adds a 4-byte uniquifier.
   - Static, because updating the key moves the row and touches every index.
-  - Ever-increasing, to avoid page splits (see [B3.11](#b311-how-uuids-in-bplustree-indexes-affect-performance)).
+  - Ever-increasing, to avoid page splits (see [B3.11](#b311-how-uuids-in-btree-indexes-affect-performance)).
   - **Exception:** cluster on the dominant **range-access** key, e.g., `(tenant_id, created_at, id)` to co-locate a tenant's rows, when range reads dominate and you accept insert spread.
 - **Trade-offs:** range scans and PK lookups are fast because the data is in the leaf. Secondary lookups cost more, wide or random keys hurt everything, and MySQL tables with no PK are a replication (row-based) and performance hazard.
 - **Interview angles:**
