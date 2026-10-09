@@ -445,6 +445,10 @@
   - "Walk through scheduling a pod" → see C5.16 sequence and the diagram below.
   - "Why is etcd the bottleneck at scale?" → every write goes through Raft consensus + fsync; many watchers; large objects; event churn. EKS **Provisioned Control Plane** tiers (XL–8XL, $1.65–$13.90/h on top of cluster fee) exist for very large clusters.
   - "Can pods run without the API server?" → yes, existing pods keep running (kubelet static pods too); nothing reconciles.
+- **OpenShift deltas** (deep dive: [N7 OpenShift](../N-cicd-platform-engineering/N7-openshift.md)):
+  - Same control plane, plus a **Cluster Version Operator** and Operators (OLM) that manage the platform's own components; nodes run immutable **RHCOS** and are upgraded by the Machine Config Operator.
+  - Uses **CRI-O**, **OVN-Kubernetes** CNI, an HAProxy **Router** (`Route` objects alongside Ingress/Gateway API) and **SCCs** on top of Pod Security Admission. Pods get arbitrary UIDs, so images must run as non-root.
+  - Managed options: **ROSA** (AWS) vs **ARO** (Azure) are the OpenShift counterparts of EKS vs AKS.
 
 ## C5.26 Rolling updates
 - **How it works:**

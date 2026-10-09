@@ -6,7 +6,7 @@ Source curriculum: [`../infra-architecture-curriculum.md`](../infra-architecture
 
 ## Suggested study order
 
-A → F → H → B → G → C → D → E, with I alongside related sections; then J (SRE), K (AI infra), L (privacy & AI security), M (data platforms).
+A → F → H → B → G → C → D → E, with I alongside related sections; then J (SRE), K (AI infra), L (privacy & AI security), M (data platforms), N (CI/CD & platform), O (observability tools), P (security platforms & identity), Q (healthcare & payments), R (support & communication). Language refreshers: [../languages/](../languages/README.md).
 
 ## Sections
 
@@ -131,6 +131,7 @@ A → F → H → B → G → C → D → E, with I alongside related sections; 
 - [K7 AI Gateways, Caching and Cost](K-ai-infra-llm/K7-ai-gateways-caching-cost.md) — 9 topics
 - [K8 Agents, Tool Use and MCP](K-ai-infra-llm/K8-agents-tool-use-mcp.md) — 15 topics
 - [K9 LLMOps, Evals and Guardrails](K-ai-infra-llm/K9-llmops-evals-guardrails.md) — 11 topics
+- [K10 ML Fundamentals for Infra, SRE and AI Engineers](K-ai-infra-llm/K10-ml-fundamentals.md) — 16 topics
 
 ### [L. Data Privacy & AI Security](L-data-privacy-ai-security/README.md)
 
@@ -151,6 +152,43 @@ A → F → H → B → G → C → D → E, with I alongside related sections; 
 - [M5 Stream processing](M-data-platforms/M5-stream-processing.md) — 13 topics
 - [M6 Orchestration & ETL/ELT](M-data-platforms/M6-orchestration-etl.md) — 11 topics
 - [M7 Data Warehouses (Cloud OLAP)](M-data-platforms/M7-data-warehouses.md) — 13 topics
+
+### [N. CI/CD & Platform Engineering](N-cicd-platform-engineering/README.md)
+
+- [N1 GitHub Actions](N-cicd-platform-engineering/N1-github-actions.md) — 12 topics
+- [N2 GitLab CI/CD and Jenkins](N-cicd-platform-engineering/N2-gitlab-ci-jenkins.md) — 16 topics
+- [N3 Azure DevOps & AWS CodePipeline (cloud-native CI/CD)](N-cicd-platform-engineering/N3-azure-devops-aws-codepipeline.md) — 15 topics
+- [N4 GitOps with Argo CD and Flux](N-cicd-platform-engineering/N4-gitops-argocd-flux.md) — 17 topics
+- [N5 IaC Pipelines & Policy as Code](N-cicd-platform-engineering/N5-iac-pipelines-policy-as-code.md) — 15 topics
+- [N6 Internal Developer Platforms (Platform Engineering, Backstage, Golden Paths)](N-cicd-platform-engineering/N6-internal-developer-platforms.md) — 13 topics
+- [N7 OpenShift](N-cicd-platform-engineering/N7-openshift.md) — 17 topics
+
+### [O. Observability Tooling](O-observability-tooling/README.md)
+
+- [O1 Prometheus (deep dive)](O-observability-tooling/O1-prometheus.md) — 11 topics
+- [O2 Grafana and the LGTM stack (Loki, Grafana, Tempo, Mimir + Alloy, Pyroscope)](O-observability-tooling/O2-grafana-lgtm-stack.md) — 12 topics
+- [O3 Elastic Stack (Elasticsearch, Kibana, Agent/Fleet, APM) for observability and security](O-observability-tooling/O3-elastic-stack.md) — 14 topics
+- [O4 Datadog](O-observability-tooling/O4-datadog.md) — 13 topics
+- [O5 Zabbix](O-observability-tooling/O5-zabbix.md) — 15 topics
+
+### [P. Security Platforms & Identity](P-security-platforms-identity/README.md)
+
+- [P1 Wiz & CNAPP (Cloud-Native Application Protection)](P-security-platforms-identity/P1-wiz-cnapp.md) — 13 topics
+- [P2 CrowdStrike, EDR & XDR](P-security-platforms-identity/P2-crowdstrike-edr-xdr.md) — 12 topics
+- [P3 SOC 2 / ISO 27001 compliance operations](P-security-platforms-identity/P3-soc2-iso-compliance-operations.md) — 11 topics
+- [P4 Identity providers (IdPs): SAML, OIDC, SCIM, Okta, Entra ID, Keycloak, and federating the cloud](P-security-platforms-identity/P4-identity-providers.md) — 15 topics
+
+### [Q. Industry Domains (Healthcare, Payments)](Q-industry-domains/README.md)
+
+- [Q1 Healthcare interoperability](Q-industry-domains/Q1-healthcare-interoperability.md) — 14 topics
+- [Q2 Healthcare cloud & HIPAA engineering](Q-industry-domains/Q2-healthcare-cloud-hipaa-engineering.md) — 13 topics
+- [Q3 Payment processing integration](Q-industry-domains/Q3-payment-processing-integration.md) — 19 topics
+
+### [R. Support & Communication](R-support-communication/README.md)
+
+- [R1 Incident Communication](R-support-communication/R1-incident-communication.md) — 11 topics
+- [R2 Ticket handling etiquette & Jira (support engineering)](R-support-communication/R2-ticket-handling-jira.md) — 11 topics
+- [R3 Writing for Audiences (technical and non-technical)](R-support-communication/R3-writing-for-audiences.md) — 14 topics
 
 ## Cross-cutting topics (where each is covered)
 
