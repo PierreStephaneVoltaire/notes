@@ -10,6 +10,10 @@
 - **Terraform state** is the crown jewel: use remote backends with locking. S3 backend: **`use_lockfile = true`** (S3-native, GA in Terraform 1.11; **DynamoDB locking is deprecated**). azurerm backend: **blob lease** locking natively. Encrypt it; it contains secrets.
 - **Cloud containers (as of 2026-10)**: AWS = ECS (on EC2 or Fargate), **ECS Express Mode**, EKS, Lambda container images; **App Runner is closed to new customers** (AWS recommends ECS Express Mode). Azure = Container Apps, ACI, AKS (Standard/Automatic), App Service, Functions.
 - **Native IaC**: CloudFormation/CDK (AWS) vs ARM/Bicep + deployment stacks (Azure); **Terraform/OpenTofu** is the cross-cloud common denominator. **GitOps** (Argo CD/Flux) = Git as desired state + in-cluster pull-based reconciliation.
+- **Kubernetes = API server + etcd + controllers reconciling desired state** (latest minor v1.37 as of 2026-10). Know the pod-creation path, Service types (ClusterIP/headless/NodePort/LoadBalancer), CoreDNS names, kube-proxy modes (iptables default, nftables future default), HPA/VPA/**in-place pod resize (GA v1.35)**, Cluster Autoscaler vs **Karpenter** (basis of EKS Auto Mode and AKS NAP).
+- **North-south routing: Gateway API is the successor to the frozen Ingress API; ingress-nginx was retired in March 2026** (no more security patches) — migrate with Ingress2Gateway.
+- **Deployment strategies:** recreate (downtime, no overlap) → rolling (`maxSurge`/`maxUnavailable` 25 %/25 %) → blue/green (2× capacity, instant rollback) → canary (weighted traffic + metric gates, Argo Rollouts/Flagger) → A/B (segment targeting for product experiments). Every overlap strategy requires N/N-1 compatible schemas.
+- **Cloud:** EKS $0.10/cluster-h standard (14 months) / $0.60 extended (+12 months), 7-day control-plane rollback; AKS Free/Standard/Premium(LTS), SLA 99.95 % with AZs; **EKS Auto Mode ↔ AKS Automatic**; ECS native blue/green + canary/linear ↔ Container Apps revisions and App Service slots.
 
 ## C5.1 Large scale deployment challenges
 - **How it works / what's hard:**
@@ -257,7 +261,260 @@
   - "Bicep has no state — pro or con?" → no state corruption/locking issues, but deletions require Complete mode or deployment stacks.
   - Pitfall: CloudFormation stack stuck in `UPDATE_ROLLBACK_FAILED` → `continue-update-rollback` with resources to skip; manual changes cause drift that breaks updates.
 
-<!-- PART2-IDS-GO-HERE -->
+## C5.16 Kubernetes lifecycle management
+- **How it works:**
+  - **Declarative desired state:** you `apply` objects (spec) to the API server; **controllers** run **reconciliation loops**: watch → diff `spec` vs `status`/observed world → act → repeat. Level-triggered (re-converges after missed events), not edge-triggered.
+  - **Ownership chain:** Deployment → ReplicaSet → Pods (via `ownerReferences`); **garbage collector** cascades deletes (`--cascade=background|foreground|orphan`). **Finalizers** block deletion until cleanup is done (common cause of "stuck Terminating" namespaces/PVCs).
+  - **Pod lifecycle phases:** `Pending` → `Running` → `Succeeded`/`Failed` (`Unknown` if node lost). Container states: Waiting/Running/Terminated. `restartPolicy`: Always (Deployments), OnFailure/Never (Jobs).
+  - **Probes:** `startupProbe` (gates the others; slow starters), `livenessProbe` (fail → kubelet restarts container), `readinessProbe` (fail → removed from EndpointSlices, no restart). **Native sidecars** = init containers with `restartPolicy: Always` (GA in v1.33): start before and stop after main containers.
+  - **Termination:** Pod marked terminating → removed from endpoints (asynchronously) **and** `preStop` hook + `SIGTERM` in parallel → wait `terminationGracePeriodSeconds` (default **30 s**) → `SIGKILL`. Add a short `preStop` sleep so LBs/kube-proxy stop routing before the process exits.
+  - **Self-healing:** ReplicaSet recreates deleted pods; node lost → node-lifecycle controller taints `node.kubernetes.io/unreachable`; pods get default `tolerationSeconds: 300` before eviction (≈5 min of "ghost" pods — tune for faster failover).
+  - **Operators** = CRD + custom controller encoding day-2 ops (backups, failover, upgrades) for stateful systems (e.g. CloudNativePG, Strimzi, Prometheus Operator).
+- **Trade-offs / when to use:**
+  - Reconciliation means manual changes get reverted (by controllers or GitOps); fix the source of truth.
+  - Operators add power but also another control plane to upgrade/secure.
+- **Interview angles:**
+  - "What happens on `kubectl apply` of a Deployment?" → authn/authz/admission → etcd persist → deployment controller creates ReplicaSet → RS controller creates Pods → scheduler binds → kubelet pulls/starts via CRI → readiness → EndpointSlice → kube-proxy/CNI programs dataplane.
+  - Pitfall: liveness probe that checks downstream dependencies → cascading restarts during a DB blip. Liveness = "process is wedged" only.
+  - Pitfall: 502s during rollout → missing `preStop` delay / readiness, or app ignoring SIGTERM (shell-form ENTRYPOINT).
+
+## C5.17 Kubernetes naming and addressing
+- **How it works:**
+  - **Every Pod gets its own IP** (flat network, no NAT between pods) — implemented by the **CNI** (AWS VPC CNI: pod IPs from VPC subnets; Azure CNI / **Azure CNI Overlay**; Cilium, Calico). Pod IPs are ephemeral → never address pods directly.
+  - **Service** = stable virtual IP + DNS name in front of a label-selected set of pods; endpoints tracked in **EndpointSlices** (default ≤100 endpoints per slice; the legacy `Endpoints` API is deprecated since v1.33).
+  - **Service types:**
+
+| Type | What you get | Typical use |
+|---|---|---|
+| `ClusterIP` (default) | Virtual IP reachable only inside the cluster | East-west service calls |
+| Headless (`clusterIP: None`) | No VIP; DNS returns **pod IPs** directly (A/AAAA per ready pod) | StatefulSets, client-side LB, gRPC, DB peers |
+| `NodePort` | ClusterIP + port on every node (default range **30000–32767**) | Behind an external LB, bare metal |
+| `LoadBalancer` | NodePort + cloud LB provisioned by cloud controller (AWS LB Controller → NLB; AKS → Azure Load Balancer) | L4 north-south |
+| `ExternalName` | DNS CNAME to an external name, no proxying | Aliasing external DBs/SaaS |
+
+  - **DNS (CoreDNS):** `<svc>.<ns>.svc.cluster.local` → ClusterIP; SRV records `_<port>._<proto>.<svc>.<ns>.svc.cluster.local`; StatefulSet pods get stable names `<pod>-<ordinal>.<headless-svc>.<ns>.svc.cluster.local`.
+  - Pod `resolv.conf` defaults to `ndots:5` + search domains → external names like `api.example.com` trigger several NXDOMAIN lookups first. Use FQDNs with a trailing dot, lower `ndots`, or NodeLocal DNSCache (AKS Automatic **LocalDNS** preconfigured; EKS Auto Mode includes local DNS).
+  - **Labels/selectors** are the glue (Service → Pods, Deployment → RS → Pods); **namespaces** scope names, RBAC, quotas, network policies.
+- **Trade-offs / when to use:**
+  - ClusterIP + kube-proxy gives L4 connection-level balancing; long-lived HTTP/2 or gRPC connections stick to one pod → use headless + client-side LB or a mesh/L7 proxy.
+  - `LoadBalancer` per service = one cloud LB each (cost, quota) → consolidate with Ingress/Gateway.
+- **Interview angles:**
+  - "Why not use DNS round robin to pods?" → client DNS caching/TTL ignorance; VIPs avoid that (this is the exact reason the K8s docs give).
+  - "DNS latency spikes in pods" → ndots:5 amplification, conntrack races on UDP DNS, CoreDNS scaling (cluster-proportional autoscaler).
+  - Cross-link DNS deep dives: [H3](../H-full-stack-troubleshooting/H3-domain-name-system.md), [G3](../G-cloud-network-architecture/G3-network-dns-and-dhcp.md).
+
+## C5.18 Kubernetes scaling with multiple instances
+- **How it works:**
+  - **Manual:** `kubectl scale deploy/x --replicas=N`.
+  - **HPA (`autoscaling/v2`):** controller loop (default every **15 s**) computes `desired = ceil(current × currentMetric / targetMetric)`; ignores changes within **10 % tolerance**; metrics: Resource (CPU/memory via metrics-server, utilization is **% of requests**), Pods, Object, External (queue depth via adapters). `behavior` field: scale-down **stabilization window default 300 s**, scale-up policies (e.g. 100 % or 4 pods per 15 s). Requires resource **requests** set.
+  - **VPA (add-on, CRDs):** recommender + updater + admission webhook; `updateMode`: `Off` (recommend only), `Initial`, `Recreate`, `InPlaceOrRecreate` (uses in-place resize, falls back to eviction); `Auto` is deprecated. Don't combine VPA and HPA on the **same CPU/memory metric**.
+  - **In-place Pod resize — GA in v1.35** (`InPlacePodVerticalScaling` locked on): change `spec.containers[*].resources` via the **`resize` subresource** (`kubectl patch pod … --subresource resize`); per-resource `resizePolicy` (`NotRequired` vs `RestartContainer`); status conditions `PodResizePending` (`Infeasible`/`Deferred`) and `PodResizeInProgress`; **QoS class cannot change**. Scheduler preemption for deferred resizes is alpha in v1.37.
+  - **KEDA** (CNCF graduated): event-driven scaling incl. **scale to zero** (SQS, Service Bus, Kafka lag, Prometheus, cron). Built into Azure Container Apps; AKS add-on.
+  - **Node autoscaling:**
+
+| | Cluster Autoscaler (CA) | Karpenter |
+|---|---|---|
+| Model | Scales pre-defined node groups (ASG/VMSS) up/down | Provisions individual nodes directly from pending pod requirements (no node groups) |
+| Instance choice | Fixed per node group | Picks from a wide set of instance types/Spot/On-Demand per `NodePool` + `NodeClass` |
+| Speed | Slower (ASG round-trip, one group at a time) | Faster, bin-packs, **consolidation** replaces underused nodes |
+| Disruption | Scale-down of empty/underused nodes | Consolidation, drift, `expireAfter`, disruption budgets |
+| Where | Any cloud; AKS cluster autoscaler | Karpenter v1 API; **EKS Auto Mode** and **AKS Node Auto-Provisioning (NAP)** are Karpenter-based |
+
+- **Trade-offs / when to use:**
+  - HPA scales out stateless services; VPA/in-place resize right-sizes (especially singletons, JVMs, batch); KEDA for queue consumers and bursty async work.
+  - Autoscaling chain latency = metric scrape + HPA loop + pod scheduling + **node provisioning + image pull** → minutes. Keep headroom (overprovisioning pause pods with low PriorityClass) for spiky traffic.
+- **Interview angles:**
+  - "HPA not scaling" → no requests set, metrics-server missing, `maxReplicas` hit, pods Pending (no nodes), stabilization window.
+  - "HPA on CPU for an I/O-bound service?" → wrong signal; use RPS/latency/queue depth (custom/external metrics, KEDA).
+  - "CA vs Karpenter?" → see table; Karpenter's consolidation cuts cost but increases churn → protect with PDBs and `karpenter.sh/do-not-disrupt`.
+
+## C5.19 Kubernetes load balancing
+- **How it works:**
+  - **East-west (Service VIP):** **kube-proxy** on each node watches Services/EndpointSlices and programs the kernel:
+
+| Mode | Mechanism | Notes (as of v1.37) |
+|---|---|---|
+| `iptables` | DNAT rule chains per Service/endpoint, random selection | **Default**; O(n) rule updates hurt at tens of thousands of endpoints |
+| `ipvs` | Kernel L4 load balancer, hash tables, many algorithms (rr, lc, sh…) | Better scale historically; reported deprecated upstream in favour of nftables (unverified exact version) |
+| `nftables` | nftables sets/maps, incremental updates | GA; the docs say it **will become the default in a future release** — pin `--proxy-mode` explicitly |
+| eBPF (no kube-proxy) | Cilium kube-proxy replacement | Used by Azure CNI powered by Cilium (AKS Automatic default) |
+
+  - Balancing is per **connection** (L4), not per request. `sessionAffinity: ClientIP` optional.
+  - **Traffic policies:** `externalTrafficPolicy: Local` preserves client source IP and avoids a second hop but can imbalance load (only nodes with local pods receive traffic, LB health check port tells cloud LB which nodes). `internalTrafficPolicy: Local` for node-local agents. **`trafficDistribution`**: `PreferClose` (GA v1.33), `PreferSameZone` / `PreferSameNode` (newer; verify state on your version) — reduces cross-AZ cost/latency.
+  - **North-south L7:** **Ingress** (API is **frozen**; controller-specific annotations) vs **Gateway API** (`GatewayClass` → `Gateway` → `HTTPRoute`/`GRPCRoute`, plus TLS/TCP/UDP routes): role-oriented (infra provider / cluster operator / app dev), cross-namespace attachment via `allowedRoutes` + `ReferenceGrant`, **native weighted backends and header matching** (canary/A-B without annotations). Core kinds are GA (`gateway.networking.k8s.io/v1`).
+  - **ingress-nginx (kubernetes/ingress-nginx) is retired:** best-effort maintenance ended **March 2026**; no more releases, bug fixes or **security patches**; existing installs keep running. Migrate to Gateway API (tool: **Ingress2Gateway 1.0**) or another controller (F5 NGINX Ingress, Traefik, HAProxy, Envoy Gateway, Istio, Cilium, cloud controllers). AKS Automatic defaults to **Gateway API via the application routing add-on from AKS 1.36** (managed NGINX before that).
+  - **Cloud integration:** AWS Load Balancer Controller → ALB for Ingress/Gateway, NLB for `LoadBalancer` Services; **IP target mode** sends straight to pod IPs (skips NodePort hop). AKS → Azure Load Balancer for Services; **Application Gateway for Containers** (Gateway API/Ingress) for L7.
+- **Trade-offs / when to use:**
+  - Service mesh (Istio ambient, Linkerd, Cilium) adds per-request L7 LB, retries, mTLS, outlier detection — at the cost of complexity/latency.
+- **Interview angles:**
+  - "One pod gets all gRPC traffic" → L4 connection balancing + HTTP/2 multiplexing; fix with L7 proxy/mesh or client-side LB over a headless Service.
+  - "Why lose client IP?" → SNAT through NodePort hop; use `externalTrafficPolicy: Local`, proxy protocol, or IP target mode.
+  - "Ingress vs Gateway API?" → Gateway API is the successor: typed, portable routing features, separation of duties; Ingress is frozen and the most-used controller is retired.
+  - L4 vs L7 LB theory: cross-link [C2 Scalability](../C-large-scale-architecture/C2-scalability.md), [D1](../D-system-design/D1-system-design-basics.md), [H6](../H-full-stack-troubleshooting/H6-web-application-architecture.md).
+
+## C5.20 Kubernetes high availability
+- **How it works:**
+  - **Control plane HA:** ≥3 API server replicas behind an LB (stateless), **etcd** with Raft quorum (3 nodes tolerate 1 failure, 5 tolerate 2; even counts add no tolerance), scheduler and controller-manager **active/passive via Lease-based leader election**. Spread across 3 AZs. Managed: EKS runs control plane across AZs (99.95 % API SLA); AKS Standard/Premium SLA **99.95 % with AZs / 99.9 % without** (Free = no financial SLA); AKS control plane is auto-zonal in AZ regions.
+  - **Data plane is your job:** node pools spread over AZs; ≥2–3 replicas per workload; **`topologySpreadConstraints`** (`topologyKey: topology.kubernetes.io/zone`, `maxSkew`, `whenUnsatisfiable: DoNotSchedule|ScheduleAnyway`); pod **anti-affinity** for host spread.
+  - **PodDisruptionBudgets** limit *voluntary* disruptions (drain, Karpenter consolidation, node upgrades) via the Eviction API: `minAvailable` or `maxUnavailable`; `unhealthyPodEvictionPolicy: AlwaysAllow` lets drains evict already-broken pods. PDBs do **not** protect against node crashes (involuntary).
+  - **PriorityClass + preemption** keeps critical pods scheduled under pressure; resource requests/limits + QoS (Guaranteed/Burstable/BestEffort) decide eviction order under node pressure.
+  - Stateful HA: StatefulSet + PVs are **zonal** (EBS, Azure Disk LRS) → a pod can't reschedule into another AZ with its volume; use replication at the app layer (DB replicas per AZ) or zone-redundant storage (Azure ZRS disks, EFS/Azure Files).
+  - **Multi-cluster** for region-level HA/blast radius: global LB (Route 53 / Front Door / Traffic Manager / Cloudflare), GitOps fan-out, cell architecture.
+- **Trade-offs / when to use:**
+  - `DoNotSchedule` spread can leave pods Pending during an AZ outage; `ScheduleAnyway` keeps capacity but may skew.
+  - PDB `maxUnavailable: 0` / `minAvailable: 100%` **blocks node drains and cluster upgrades forever** (EKS Auto Mode then forces after 21-day node lifetime).
+- **Interview angles:**
+  - "etcd with 4 nodes?" → quorum 3, still tolerates only 1 failure; worse write latency than 3. Use odd numbers.
+  - "API server down — do apps go down?" → no: running pods, kube-proxy rules and CNI keep working; you lose scheduling, scaling, self-healing and deploys.
+  - "Design for AZ failure" → 3 AZs, spread constraints, N+1 capacity per AZ (or fast autoscaling), PDBs, zone-aware storage, `trafficDistribution`/topology-aware routing, AWS ARC zonal shift (EKS supported).
+  - Deep reliability patterns: [C3 Reliability](../C-large-scale-architecture/C3-reliability.md).
+
+## C5.21 Kubernetes rolling upgrades
+- **Two meanings — know both:**
+- **Application rolling upgrade (Deployment `RollingUpdate`):** see C5.26 for `maxSurge`/`maxUnavailable` mechanics.
+- **Cluster upgrade (control plane + nodes):**
+  - Order: **control plane first, one minor version at a time** (no skipping on EKS/AKS) → add-ons (CoreDNS, kube-proxy, CNI, CSI) → node pools.
+  - **Version skew policy:** API servers within 1 minor of each other; **kubelet may be up to 3 minors older** than the API server (never newer); kubectl ±1.
+  - **Release cadence:** ~3 minors/year; upstream patches the latest **3 minors** (~14 months each). As of 2026-10: v1.37 latest; 1.34 EOL 2026-10-27.
+  - **Node upgrade strategies:** in-place rolling by surge (cordon → drain respecting PDBs → replace); AKS `maxSurge` (default 10 % (unverified current default)), `drainTimeout`, `nodeSoakDuration`, `undrainableNodeBehavior`; EKS managed node groups `maxUnavailable` (count or %); **blue/green node pools** (create new pool, taint/drain old, delete) for safer rollback; Karpenter **drift** replaces nodes when AMI/NodeClass changes.
+  - **EKS:** standard support **14 months** ($0.10/cluster-h), extended support **+12 months** ($0.60/cluster-h; enabled by default; auto-upgraded at end); **in-place control plane upgrades can be rolled back to the previous minor within 7 days**; Upgrade Insights flags deprecated API usage.
+  - **AKS:** auto-upgrade channels (`none`, `patch`, `stable` = N-1 minor, `rapid`, `node-image`) + node OS channels (`NodeImage`, `SecurityPatch`, `Unmanaged`, `None`); **planned maintenance windows**; upgrades **stop automatically on detected deprecated API usage**; **Premium tier = LTS** (2 years per version).
+- **Trade-offs / when to use:**
+  - In-place surge = cheap, slower rollback; blue/green node pools = double capacity briefly, instant fallback.
+- **Interview angles:**
+  - "Upgrade from 1.31 to 1.35 on EKS?" → four sequential control-plane upgrades (1.32, 1.33, 1.34, 1.35); nodes can lag ≤3 minors but upgrade them between hops; check removed APIs (pluto/kubent, Upgrade Insights) first.
+  - Pitfall: drain blocked by a PDB on a single-replica deployment, or pods with local storage/no controller.
+  - "Can you downgrade Kubernetes?" → upstream: not supported; EKS now offers a 7-day rollback window — otherwise restore via new cluster + GitOps/backup (Velero).
+
+## C5.22 Kubernetes capabilities
+- **What Kubernetes gives you (the "why K8s" answer):**
+  - Declarative config + reconciliation; **scheduling/bin-packing** with requests, affinity, taints/tolerations, topology spread; **self-healing**; **service discovery + L4 LB**; **horizontal/vertical autoscaling**; **rolling updates + rollback**; **config and secrets** (ConfigMaps, Secrets — base64, not encrypted unless KMS envelope encryption enabled: EKS KMS, AKS KMS/Key Vault); **storage orchestration** (CSI, PV/PVC, StorageClass, dynamic provisioning, snapshots); **batch** (Jobs/CronJobs); **RBAC**, **NetworkPolicy**, **Pod Security Admission** (privileged/baseline/restricted); **extensibility** (CRDs, operators, admission webhooks, **ValidatingAdmissionPolicy (CEL)**); **DRA** for GPUs/accelerators (GA v1.34).
+- **What it does not give you out of the box:** CI/build, L7 traffic shaping/progressive delivery (needs Argo Rollouts/Flagger/mesh), observability stack, secrets management (External Secrets/CSI Secrets Store), multi-cluster, policy beyond PSA (Kyverno/Gatekeeper), backups (Velero).
+- **Trade-offs / when to use:**
+  - Worth it for many services, multi-team platforms, portability, rich ecosystem; overkill for a handful of services (ECS/Container Apps/App Service cheaper to operate).
+- **Interview angles:**
+  - "Kubernetes vs ECS?" → K8s: portable API, CRDs/operators, huge ecosystem, more ops/upgrade toil (3 minors/year); ECS: AWS-native, simpler, no version upgrades, tighter IAM/ALB integration, AWS lock-in.
+  - Pitfall: treating Secrets as secure by default — enable encryption at rest + RBAC + external secret store.
+
+## C5.23 Kubernetes deployment
+- **How it works (the Deployment object):**
+  - `apps/v1` Deployment manages **ReplicaSets**; each change to `.spec.template` creates a new RS (identified by `pod-template-hash`) and a new **revision**; scaling does **not** create a revision.
+  - Key fields / defaults: `strategy.type` `RollingUpdate` (default) or `Recreate`; `maxSurge` **25 %** (rounded up), `maxUnavailable` **25 %** (rounded down); `minReadySeconds` **0**; `revisionHistoryLimit` **10**; `progressDeadlineSeconds` **600** (after which condition `Progressing=False, reason ProgressDeadlineExceeded` — it does **not** auto-rollback).
+  - Commands: `kubectl rollout status|history|undo [--to-revision=N]|pause|resume|restart`. `rollout restart` patches an annotation to trigger a fresh rollout (e.g. pick up new Secret values).
+  - **Proportional scaling:** scaling mid-rollout distributes new replicas across old and new RS in proportion.
+  - Packaging/delivery tools: **Helm** (charts, releases, `helm rollback`), **Kustomize** (overlays, built into kubectl), GitOps (**Argo CD**, **Flux**) — see C5.5.
+- **Trade-offs / when to use:**
+  - Native Deployment = no traffic-percentage control (ratio is pods, not requests), no metric analysis, no automatic rollback → use Argo Rollouts/Flagger for that.
+- **Interview angles:**
+  - "Rollout hung" → `kubectl rollout status` times out; check new pods (ImagePullBackOff, CrashLoopBackOff, failing readiness), quota, Pending pods; then `rollout undo`.
+  - "How does K8s roll back?" → it scales the previous ReplicaSet back up (template copied into a new revision number). Image tag reuse breaks this — pin digests.
+  - Gotcha: `kubectl apply` with `replicas` set while HPA manages the Deployment → fights the HPA; omit `replicas` from manifests under HPA.
+
+## C5.24 Kubernetes services and workloads
+- **Workload controllers:**
+
+| Controller | Use for | Identity / storage | Update strategy |
+|---|---|---|---|
+| **Deployment** (→ ReplicaSet) | Stateless services | Interchangeable pods, random names | RollingUpdate / Recreate |
+| **StatefulSet** | Databases, Kafka, ZooKeeper, quorum systems | Stable ordinal names `web-0..N`, stable DNS via headless Service, **per-pod PVC** via `volumeClaimTemplates` | RollingUpdate (reverse ordinal, `partition` for staged/canary), OnDelete; `podManagementPolicy: OrderedReady|Parallel` |
+| **DaemonSet** | One pod per (selected) node: log shippers, CNI, CSI, node exporters, security agents | Node-bound | RollingUpdate (`maxUnavailable`, `maxSurge`) / OnDelete |
+| **Job** | Run-to-completion batch | — | `completions`, `parallelism`, `backoffLimit` (default 6), `activeDeadlineSeconds`, indexed jobs, `podFailurePolicy`, `ttlSecondsAfterFinished`; `managedBy` GA v1.35 |
+| **CronJob** | Scheduled jobs | — | `schedule`, `timeZone`, `concurrencyPolicy: Allow|Forbid|Replace`, `startingDeadlineSeconds` |
+
+- **Services** (see C5.17) connect workloads; **headless Services** are mandatory for StatefulSet network identity.
+- **Trade-offs / when to use:**
+  - Run stateful systems in K8s only with an operator and a tested backup/restore path; managed DBs (RDS/Aurora ↔ Azure Database/SQL) are usually the better default.
+  - StatefulSet PVCs are **not deleted** on scale-down by default (`persistentVolumeClaimRetentionPolicy` controls this).
+- **Interview angles:**
+  - "Deployment vs StatefulSet?" → identity + ordered rollout + stable storage vs interchangeable replicas.
+  - "Canary a StatefulSet?" → `rollingUpdate.partition: N` updates only ordinals ≥ N.
+  - "Why did my DaemonSet not land on a node?" → taints without tolerations, nodeSelector/affinity, resource pressure.
+
+## C5.25 Kubernetes architecture
+- **Control plane:**
+  - **kube-apiserver**: the only component that talks to etcd; REST + **watch**; pipeline = authentication → authorization (RBAC/Node/Webhook) → **mutating admission** → schema validation → **validating admission** (webhooks, ValidatingAdmissionPolicy) → persist. Optimistic concurrency via `resourceVersion`. API Priority & Fairness protects it from noisy clients.
+  - **etcd**: Raft-replicated KV store of all cluster state; default backend quota **2 GiB** (configurable, ~8 GiB suggested max); request size limit ~1.5 MiB (why huge ConfigMaps/CRDs fail); needs low-latency disks; back it up (snapshot) — managed services do this for you.
+  - **kube-scheduler**: watches unbound pods → **filter** (resources, taints, affinity, topology) → **score** → **bind**. Pluggable scheduling framework/profiles.
+  - **kube-controller-manager**: built-in controllers (Deployment, ReplicaSet, StatefulSet, Job, Node lifecycle, EndpointSlice, ServiceAccount, GC, namespace…).
+  - **cloud-controller-manager**: cloud-specific loops (nodes, routes, `LoadBalancer` Services).
+- **Node components:**
+  - **kubelet**: registers node, heartbeats via **Lease** objects (~10 s), runs pods through **CRI** (containerd/CRI-O → runc), runs probes, reports status, evicts on node pressure. **kube-proxy** (or eBPF replacement). **CNI** plugin for pod networking; **CSI** node plugin for volumes.
+  - Add-ons: CoreDNS, metrics-server, ingress/gateway controller.
+- **Managed split:** EKS/AKS run API server + etcd + controllers in a provider-managed account/subscription; you see the endpoint (public, private, or both). EKS Auto Mode / AKS Automatic additionally manage nodes and core add-ons.
+- **Interview angles:**
+  - "Walk through scheduling a pod" → see C5.16 sequence and the diagram below.
+  - "Why is etcd the bottleneck at scale?" → every write goes through Raft consensus + fsync; many watchers; large objects; event churn. EKS **Provisioned Control Plane** tiers (XL–8XL, $1.65–$13.90/h on top of cluster fee) exist for very large clusters.
+  - "Can pods run without the API server?" → yes, existing pods keep running (kubelet static pods too); nothing reconciles.
+
+## C5.26 Rolling updates
+- **How it works:**
+  - Replace instances incrementally: bring up new (surge) → wait until ready (+ `minReadySeconds`) → remove old → repeat. In K8s: new RS scaled up by ≤ `maxSurge`, old RS scaled down keeping ≥ `replicas − maxUnavailable` available.
+  - Example: `replicas: 10`, `maxSurge: 25 %` → **3** extra pods (rounded up); `maxUnavailable: 25 %` → **2** may be unavailable (rounded down) → 8–13 pods during the rollout. `maxSurge: 0, maxUnavailable: 1` = no extra capacity (quota-tight); `maxSurge: 100 %, maxUnavailable: 0` = fastest zero-downtime but doubles capacity briefly. Both cannot be 0.
+  - Equivalents: ECS rolling (`minimumHealthyPercent` **100**, `maximumPercent` **200** defaults + **deployment circuit breaker** with auto-rollback); ASG instance refresh (`MinHealthyPercentage`); VMSS rolling upgrade policy (`maxBatchInstancePercent`, `maxUnhealthyInstancePercent`); AKS node surge; Container Apps single-revision mode (cut over when new revision is ready).
+- **Trade-offs / when to use:**
+  - Default for stateless services; low extra cost; zero downtime if readiness + graceful shutdown are right.
+  - **Both versions serve traffic simultaneously** → API and schema must be N/N-1 compatible. Rollback is another rolling update (slow, minutes). Blast radius grows with each step; no metric gating natively.
+- **Interview angles:**
+  - "Rolling vs canary?" → rolling gates on *health* (readiness) only and the traffic share equals pod share; canary gates on *business/SLO metrics* with explicit traffic weights and pauses.
+  - Pitfall: readiness probe that passes before warm-up (JIT, caches) → latency spike at each step; use `minReadySeconds`/startup probes.
+
+## C5.27 Canary deployment
+- **How it works:**
+  - Send a **small % of real traffic** (e.g. 1 % → 5 % → 25 % → 50 % → 100 %) to the new version, compare canary vs baseline on SLIs (error rate, p99 latency, saturation, business KPIs) during each **bake** step; **auto-promote or auto-rollback**.
+  - Traffic split mechanisms: L7 weights (Gateway API `HTTPRoute` `backendRefs.weight`, service mesh, ALB weighted target groups, NGINX/Envoy), or pod-ratio only (two Deployments behind one Service — coarse, no stickiness).
+  - **Argo Rollouts**: `Rollout` CRD replaces Deployment; `canary.steps` (`setWeight`, `pause`, `analysis`), `AnalysisTemplate`/`AnalysisRun` querying Prometheus/Datadog/New Relic/CloudWatch etc., traffic routers (ALB, NGINX, Istio, SMI, Gateway API plugin), `Experiment`s. **Flagger** (Flux project): wraps an existing Deployment, creates primary/canary, drives mesh/ingress/Gateway API weights with metric checks and webhooks.
+  - Cloud-native: **ECS native canary and linear** deployment strategies (alongside blue/green; with bake time and lifecycle hooks) and **CodeDeploy** (`ECSCanary10Percent5Minutes`, `LambdaLinear10PercentEvery1Minute` style configs, CloudWatch alarm rollback); **Lambda alias weighted routing**; **Container Apps** multiple-revision traffic weights; **App Service** "Traffic %" routing to a slot (sticky via `x-ms-routing-name` cookie for 1 h).
+  - Variants: **cell/region waves** (one-box → one AZ → one region), **shadow/dark launch** (mirror traffic, discard responses).
+- **Trade-offs / when to use:**
+  - Best risk reduction for high-traffic services; needs good observability and enough traffic for statistical significance at low weights (low-traffic services → longer bake or synthetic load).
+  - Stateful/side-effecting changes (DB migrations, async consumers) aren't isolated by HTTP weights — canary consumers process real messages.
+- **Interview angles:**
+  - "What metrics gate a canary?" → SLO-aligned: 5xx ratio, p99 latency, saturation, plus business KPIs; compare against baseline (not absolute thresholds) to cancel out traffic-mix noise.
+  - "Canary vs A/B?" → canary = *risk* (same feature, new version, random small cohort, short-lived); A/B = *product experiment* (targeted cohorts, stat significance, days–weeks).
+
+## C5.28 Recreate deployment
+- **How it works:** terminate **all** old instances, then start new ones (`strategy.type: Recreate`). Guaranteed no version overlap.
+- **Trade-offs / when to use:**
+  - **Downtime** = shutdown + startup + readiness time. Use when versions cannot coexist (incompatible schema/protocol, singleton license, exclusive `ReadWriteOnce` volume that a surge pod can't mount on another node), or for dev/test.
+  - Cheapest (no extra capacity).
+- **Interview angles:**
+  - "RWO volume + RollingUpdate deadlock" → new pod on another node can't attach the disk while old pod holds it → use Recreate (or StatefulSet).
+  - Mitigate downtime with a maintenance page at the LB/CDN and off-peak windows.
+
+## C5.29 Blue Green deployment
+- **How it works:**
+  - Two full environments: **blue** (live) and **green** (new). Deploy and test green (test listener/URL), then **switch all traffic at once** (LB listener/target group swap, Service selector change, DNS/weighted record, slot swap). Keep blue for fast rollback, then tear down.
+  - K8s: two Deployments (`version: blue|green`) and flip the Service `selector`; Argo Rollouts `blueGreen` (`activeService`, `previewService`, `autoPromotionEnabled`, `prePromotionAnalysis`, `scaleDownDelaySeconds` default 30 s).
+  - **AWS:** **ECS native blue/green** (built into ECS since 2025): lifecycle stages (e.g. pre-scale-up, test traffic shift, production traffic shift), **Lambda or pause lifecycle hooks** (`ContinueServiceDeployment`), **bake time** with both revisions running, works with ALB, NLB (adds ~10 min to traffic-shift stages), Service Connect, VPC Lattice. **CodeDeploy** blue/green for ECS, Lambda and EC2 (replacement ASG). Elastic Beanstalk CNAME swap. Route 53 weighted records.
+  - **Azure:** **App Service deployment slots** (Standard and above; Standard = 5 slots) — swap = warm-up of source slot, then routing switch; **swap with preview** (multi-phase), **auto swap** (not on Linux/containers), slot-sticky settings, swap back = rollback. **Container Apps** multiple-revision mode + **labels** (stable label URL; move label/100 % weight). AKS: two deployments / Application Gateway for Containers weights. Traffic Manager/Front Door for region-level.
+- **Trade-offs / when to use:**
+  - Instant cutover and **instant rollback**, full pre-prod test on prod infra; costs **2× capacity** during the window; all users hit the new version at once (big-bang exposure); DB must serve both versions (expand/contract); long-lived connections/sessions need draining.
+  - DNS-based switching is slow/unreliable (resolver TTL caching) → prefer LB-level switching.
+- **Interview angles:**
+  - "Blue/green with a database?" → shared DB, backward-compatible schema changes (expand before deploy, contract after blue is gone); never two DBs to sync.
+  - "ECS native blue/green vs CodeDeploy?" → native: no CodeDeploy app/deployment group, ECS-API driven, lifecycle hooks, also supports Service Connect/headless; CodeDeploy: older, AppSpec hooks, canary/linear configs (ECS now offers native canary/linear too).
+  - "App Service swap pitfalls" → slot-specific settings, warm-up path (`WEBSITE_SWAP_WARMUP_PING_PATH`), instances recycled after swap abandon long-running work.
+
+## C5.30 A/B testing
+- **How it works:**
+  - Route **specific user segments** (by header, cookie, user ID hash, geo, device) to variants and measure **business metrics** (conversion, engagement) with statistical rigor (hypothesis, sample size, significance, guardrail metrics).
+  - Implementation layers: **feature flags / experimentation platforms** (LaunchDarkly, Statsig, Optimizely, Unleash, OpenFeature; **AWS CloudWatch Evidently was discontinued** — AWS points to AppConfig feature flags (unverified exact date); Azure App Configuration **variant feature flags** with telemetry to Application Insights for experiments (exact experimentation offering naming (unverified))); or **L7 routing** by header/cookie (Gateway API `HTTPRoute` header matches, Istio `VirtualService`, Argo Rollouts header-based routes, App Service `x-ms-routing-name`, Container Apps labels); CDN/edge (CloudFront Functions, Front Door rules, Cloudflare Workers).
+  - **Sticky assignment** is mandatory (consistent hashing of user ID), otherwise users flip between variants and data is polluted.
+- **Trade-offs / when to use:**
+  - Flags = in-process, per-request targeting, no infra change, but flag debt; routing-based = separate deployments per variant, heavier.
+  - A/B tests run days–weeks; canaries run minutes–hours. Don't conflate.
+- **Interview angles:**
+  - "Deploy ≠ release" → feature flags decouple; dark launch then ramp by cohort.
+  - Pitfalls: peeking at results early, sample ratio mismatch, novelty effects, no guardrail (latency/error) metrics.
+
+| Strategy | Downtime | Extra capacity | Rollback speed | Mixed versions live | Traffic control | Typical tooling |
+|---|---|---|---|---|---|---|
+| Recreate | Yes | None | Slow (redeploy) | No | None | K8s `Recreate` |
+| Rolling | No | `maxSurge` | Slow (roll back) | Yes | Pod ratio | K8s Deployment, ECS rolling, ASG/VMSS |
+| Blue/green | No | 2× during switch | **Instant** | No (after switch) | All-or-nothing | ECS native B/G, CodeDeploy, App Service slots, ACA labels, Argo Rollouts |
+| Canary | No | Small | Fast (shift weight back) | Yes | % weights + metric gates | Argo Rollouts, Flagger, ECS canary/linear, CodeDeploy, ACA weights, Gateway API |
+| A/B | No | Per variant | Flag off | Yes | Segment/header/cookie targeting | Feature flags, Gateway API header match, mesh |
+
 
 ## Diagrams
 ```mermaid
@@ -291,6 +548,56 @@ flowchart TB
   Roll --> Old["Old instances terminated - immutable"]
 ```
 
+Kubernetes architecture and the path of `kubectl apply`:
+```mermaid
+flowchart LR
+  User["kubectl / CI / Argo CD"] -->|"1 HTTPS request"| API["kube-apiserver: authn, authz, admission"]
+  API <-->|"2 persist + watch"| ETCD[("etcd Raft cluster 3 or 5 members")]
+  subgraph CP["Control plane - managed on EKS and AKS"]
+    API
+    ETCD
+    CM["kube-controller-manager: Deployment, ReplicaSet, EndpointSlice, Node controllers"]
+    SCH["kube-scheduler: filter, score, bind"]
+    CCM["cloud-controller-manager: LoadBalancer Services, routes"]
+  end
+  CM -->|"3 create ReplicaSet and Pods"| API
+  SCH -->|"4 bind Pod to node"| API
+  subgraph Node["Worker node"]
+    KL["kubelet"] -->|"5 CRI"| CRT["containerd + runc"]
+    KL --> CNI["CNI plugin: pod IP"]
+    KP["kube-proxy iptables, ipvs, nftables or eBPF"]
+  end
+  API -->|"watch"| KL
+  API -->|"6 EndpointSlices"| KP
+  CCM -->|"provision"| LB["Cloud LB: NLB or Azure LB"]
+  LB --> KP
+```
+
+Deployment strategies side by side:
+```mermaid
+flowchart TB
+  subgraph R["Recreate"]
+    R1["v1 x4"] -->|"scale v1 to 0 - downtime"| R2["v2 x4"]
+  end
+  subgraph RU["Rolling maxSurge 1, maxUnavailable 0"]
+    U1["v1 x4"] --> U2["v1 x4 + v2 x1"] --> U3["v1 x3 + v2 x1"] --> U4["... v2 x4"]
+  end
+  subgraph BG["Blue/green"]
+    B1["LB to blue v1"] --> B2["green v2 deployed and tested on test listener"] --> B3["Switch LB to green"] --> B4["Keep blue for bake time then delete"]
+  end
+  subgraph CN["Canary with analysis"]
+    C1["5 percent to v2"] --> C2{"SLO and KPI vs baseline OK?"}
+    C2 -->|"yes"| C3["25 then 50 then 100 percent"]
+    C2 -->|"no"| C4["Abort: weight 0, rollback"]
+  end
+  subgraph AB["A/B test"]
+    A1["Router or feature flag"] -->|"cohort A sticky"| A2["Variant A"]
+    A1 -->|"cohort B sticky"| A3["Variant B"]
+    A2 --> A4["Compare conversion with significance"]
+    A3 --> A4
+  end
+```
+
 ## Cloud mapping: AWS vs Azure
 | Capability | AWS | Azure | Role it plays | Key differences | Alternatives |
 |---|---|---|---|---|---|
@@ -309,12 +616,25 @@ flowchart TB
 | GitOps | Argo CD/Flux on EKS (self-managed or EKS capability) | AKS GitOps extension (Flux v2) | Pull-based reconciliation | Azure offers Flux as a managed cluster extension | Argo CD, Flux, Rancher Fleet |
 | Config mgmt / ops | Systems Manager (State Manager, Patch Manager, Session Manager) | Azure Update Manager, Machine Configuration, Automation, Bastion | Day-2 ops on VMs | SSM agent-based on EC2/hybrid; Azure Arc extends to hybrid | Ansible, Chef, Puppet |
 | Org-level env isolation | AWS Organizations accounts + SCPs | Management groups + subscriptions + Azure Policy | Blast-radius and governance boundaries | SCPs are deny guardrails; Azure Policy can deny/audit/modify/deployIfNotExists | — |
+| K8s control plane pricing/SLA | EKS: $0.10/cluster-h (standard), $0.60 (extended); Provisioned Control Plane XL–8XL extra; 99.95 % SLA | AKS Free (no SLA, ≤1,000 nodes), Standard (SLA, ≤5,000 nodes), Premium (+LTS) | Managed API server + etcd | AKS can be free; EKS always charges; AKS SLA 99.95 % with AZs / 99.9 % without | GKE, self-managed (kubeadm), Rancher |
+| K8s version lifecycle | 14 months standard + 12 months extended (26 total); auto-upgrade at end; **7-day rollback** of in-place upgrades | ~12 months community support; **LTS 24 months on Premium**; auto-upgrade channels (`patch`/`stable`/`rapid`/`node-image`), planned maintenance | Upgrade cadence/cost | EKS charges for staying old; AKS charges for LTS tier | — |
+| "Opinionated" K8s | **EKS Auto Mode** (Karpenter-based nodes, Bottlerocket, 21-day max node life, ALB/NLB, EBS CSI, VPC CNI managed; per-instance mgmt fee) | **AKS Automatic** (NAP/Karpenter, managed system node pools, Azure CNI Overlay + Cilium, Gateway API app routing from 1.36, deployment safeguards, auto-upgrades, **pod readiness SLA 99.9 % within 5 min**) | Provider-managed data plane + add-ons | Auto Mode can be enabled on existing clusters; Automatic is a cluster SKU preconfigured on Standard tier | GKE Autopilot |
+| Node pools / scaling | Managed node groups (ASG), self-managed, Fargate profiles, Karpenter | System + user node pools (VMSS), cluster autoscaler, Node Auto-Provisioning, virtual nodes (ACI) | Worker capacity | AKS requires a **system node pool** (unless Automatic managed); EKS has no such split | Karpenter everywhere |
+| Ingress / L7 for K8s | AWS Load Balancer Controller (ALB Ingress/Gateway API, NLB Services), VPC Lattice | Application Gateway for Containers, app routing add-on (managed NGINX → Gateway API), Istio add-on | North-south routing | ingress-nginx retired 2026-03 → Gateway API on both | Envoy Gateway, Cilium, Istio, Traefik |
+| Workload autoscaling | HPA/VPA/KEDA self-installed; Auto Mode for nodes | KEDA and VPA as managed add-ons (on by default in Automatic) | Pod-level scaling | Azure ships KEDA managed; on EKS you install it | — |
+| Native blue/green and canary | ECS native blue/green + linear + canary (bake time, Lambda hooks), CodeDeploy (ECS/Lambda/EC2) | App Service slots (swap, swap with preview, Traffic %), Container Apps revisions (weights, labels) | Progressive delivery without K8s | ECS shifts at ALB/NLB/Service Connect level; App Service swaps routing between warmed slots | Argo Rollouts, Flagger |
+| Serverless container orchestrator | ECS (Fargate) / ECS Express Mode | Azure Container Apps | Simple microservice hosting | ACA: scale-to-zero, KEDA, Dapr, revisions; ECS: no K8s, deep IAM/ALB integration, task-level isolation on Fargate | Cloud Run, Knative |
 
 - **EC2 Image Builder vs Azure VM Image Builder:** both free as services (pay for build compute/storage). EIB has a first-class **test stage** that blocks distribution if tests fail, Inspector scanning, STIG components, cross-account/Org distribution, and also builds **container images**. AIB is **Packer under the hood**, VMs only, image template resource is immutable (recreate to edit), staging RG `IT_*` in your subscription, regional availability list but can distribute anywhere.
 - **Container platforms:** AWS splits ECS (native, simpler, tight IAM integration) and EKS (K8s). Azure's sweet spot is **Container Apps** for microservices without K8s ops. App Runner's closure (2026) pushes simple-web workloads to **ECS Express Mode**; Azure App Service remains the equivalent PaaS.
 - **IaC state models:** CloudFormation = service-held state, automatic rollback; ARM/Bicep = **stateless**, idempotent, no auto-rollback; Terraform = self-managed state, multi-cloud. Deployment stacks bring CFN-like "managed set + delete unmanaged + protect" semantics to Azure.
 - **Locking gotchas:** S3 locking needs bucket versioning recommended and IAM on the `.tflock` key; Azure lease locks can be left stuck by killed runs → `terraform force-unlock` or break the blob lease (`az storage blob lease break`).
 - **Alternatives:** Kubernetes everywhere (portability), Cloudflare Workers/Containers for edge apps, Pulumi (general-purpose languages, multi-cloud), Crossplane (K8s-native control plane for cloud resources).
+- **EKS vs AKS control plane:** EKS bills every cluster hour and **6× more in extended support** — an incentive to upgrade; AKS Free tier has no financial SLA and is meant for dev/test (<10 nodes recommended). AKS Premium bundles **LTS** (must set `--k8s-support-plan AKSLongTermSupport`). Both run the control plane across AZs in AZ regions.
+- **Upgrades:** both require **one minor at a time** for the control plane; managed node groups/node pools are upgraded separately (EKS does **not** auto-upgrade managed node groups with the control plane). AKS stops auto-upgrades when deprecated API usage is detected; EKS Upgrade Insights reports it. EKS Auto Mode nodes are cycled within the 21-day max lifetime honoring PDBs.
+- **EKS Auto Mode vs AKS Automatic:** both are Karpenter-based "bring workloads, not nodes" offerings with locked-down node OS (Bottlerocket ↔ Azure Linux) and managed networking/LB/storage add-ons. Differences: Automatic is a distinct SKU with **preconfigured, non-disableable** guardrails (deployment safeguards, Azure RBAC, workload identity) and a **pod readiness SLA**; Auto Mode is a mode you can switch on for an existing EKS cluster, charged per managed instance on top of EC2.
+- **ECS vs Container Apps:** ECS is an AWS-proprietary orchestrator (task definitions/services) with Fargate or EC2/Managed Instances; ACA is Kubernetes-based but hides the K8s API, adds KEDA scale-to-zero, Dapr and revision-based traffic splitting. For blue/green, ECS shifts listener/target groups (native or CodeDeploy); ACA moves revision weights/labels; App Service swaps slots.
+- **Gotchas:** EKS VPC CNI consumes VPC IPs per pod (use prefix delegation/secondary CIDRs); AKS kubenet is legacy → Azure CNI Overlay. ACA single-revision mode cuts over only when the new revision reaches previous replica count and passes probes.
 
 ## Hands-on (optional)
 Multi-stage Dockerfile with BuildKit cache and secret mounts, non-root, distroless:
@@ -405,6 +725,55 @@ aws autoscaling start-instance-refresh --auto-scaling-group-name web-asg \
   --preferences '{"MinHealthyPercentage":90,"InstanceWarmup":120,"AutoRollback":true}'
 ```
 
+Kubernetes rolling update, inspection and rollback:
+```bash
+# Tune strategy: zero-downtime, one extra pod at a time
+kubectl patch deploy/web -p '{"spec":{"minReadySeconds":10,"strategy":{"rollingUpdate":{"maxSurge":1,"maxUnavailable":0}}}}'
+# Roll out a new image by digest and record why
+kubectl set image deploy/web web=123456789012.dkr.ecr.eu-west-1.amazonaws.com/web@sha256:<digest>
+kubectl annotate deploy/web kubernetes.io/change-cause="release 1.4.2" --overwrite
+kubectl rollout status deploy/web --timeout=5m || kubectl rollout undo deploy/web
+kubectl rollout history deploy/web
+kubectl rollout undo deploy/web --to-revision=3
+kubectl rollout pause deploy/web    # batch several changes, then:
+kubectl rollout resume deploy/web
+kubectl rollout restart deploy/web  # re-create pods (e.g. after Secret rotation)
+kubectl get rs -l app=web -o wide   # old vs new ReplicaSets
+```
+
+HA guardrails, in-place resize and scaling:
+```bash
+kubectl create pdb web-pdb --selector=app=web --min-available=2
+kubectl autoscale deploy/web --cpu-percent=70 --min=3 --max=30
+kubectl get hpa web -w
+# In-place resize (GA in v1.35): change CPU without recreating the pod
+kubectl patch pod web-7c9d8-abcde --subresource resize \
+  -p '{"spec":{"containers":[{"name":"web","resources":{"requests":{"cpu":"500m"},"limits":{"cpu":"1"}}}]}}'
+kubectl get pod web-7c9d8-abcde -o jsonpath='{.status.conditions[?(@.type=="PodResizePending")]}'
+# Safe node maintenance
+kubectl cordon node-a && kubectl drain node-a --ignore-daemonsets --delete-emptydir-data --timeout=10m
+# Service / DNS debugging
+kubectl get svc,endpointslices -l app=web
+kubectl run dns --rm -it --image=busybox:1.36 --restart=Never -- nslookup web.default.svc.cluster.local
+```
+
+Cluster upgrades (one minor at a time) and blue/green on PaaS:
+```bash
+# EKS
+aws eks update-cluster-version --name prod --kubernetes-version 1.36
+aws eks update-nodegroup-version --cluster-name prod --nodegroup-name ng-general
+# AKS
+az aks get-upgrades -g rg-prod -n aks-prod -o table
+az aks update -g rg-prod -n aks-prod --auto-upgrade-channel stable
+az aks nodepool update -g rg-prod --cluster-name aks-prod -n user1 --max-surge 33%
+# App Service blue/green: swap with preview, then complete (or reset)
+az webapp deployment slot swap -g rg-web -n app1 --slot staging --target-slot production --action preview
+az webapp deployment slot swap -g rg-web -n app1 --slot staging --target-slot production --action swap
+# Container Apps canary: 90/10 between revisions
+az containerapp revision set-mode -g rg-aca -n api --mode multiple
+az containerapp ingress traffic set -g rg-aca -n api --revision-weight api--v1=90 api--v2=10
+```
+
 ## Cross-links
 - [A8.3 Virtualization and containerization (namespaces, cgroups, hypervisors)](../A-operating-systems/A8-more-os-concepts.md#a83-virtualization-and-containerization-cgroups-vs-namespaces)
 - [C3 Reliability](../C-large-scale-architecture/C3-reliability.md) — HA, failover, DR during deployments
@@ -418,6 +787,15 @@ aws autoscaling start-instance-refresh --auto-scaling-group-name web-asg \
 - [L7 Zero trust and workload identity](../L-data-privacy-ai-security/L7-zero-trust-workload-identity.md)
 - [D2 Reusable parts of system design](../D-system-design/D2-reusable-parts-of-system-design.md)
 - [G1 Virtual network fundamentals](../G-cloud-network-architecture/G1-virtual-network-fundamentals.md) — subnet/IP planning for clusters
+- [G14 Service-to-service networking](../G-cloud-network-architecture/G14-service-to-service-networking.md) — service mesh, VPC Lattice, Service Connect
+- [G3 Network DNS and DHCP](../G-cloud-network-architecture/G3-network-dns-and-dhcp.md) and [H3 Domain Name System](../H-full-stack-troubleshooting/H3-domain-name-system.md) — CoreDNS, ndots, resolver behaviour
+- [H6 Web application architecture](../H-full-stack-troubleshooting/H6-web-application-architecture.md) — L4 vs L7 proxies (Service vs Gateway)
+- [D1 System design basics](../D-system-design/D1-system-design-basics.md) — load balancers
+- [C3 Reliability](../C-large-scale-architecture/C3-reliability.md) — AZ failure design behind PDBs/topology spread
+- [J5 Capacity planning and load testing](../J-sre/J5-capacity-planning-load-testing.md) — autoscaling headroom
+- [J7 Chaos engineering](../J-sre/J7-chaos-engineering.md) — validating PDBs, AZ failover
+- [K4 LLM serving and inference](../K-ai-infra-llm/K4-llm-serving-inference.md) — GPU node pools, DRA, Karpenter for accelerators
+- [A8 More OS concepts](../A-operating-systems/A8-more-os-concepts.md) — cgroups behind requests/limits and in-place resize
 
 ## Sources
 - https://developer.hashicorp.com/terraform/language/backend/s3
@@ -437,3 +815,21 @@ aws autoscaling start-instance-refresh --auto-scaling-group-name web-asg \
 - https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/cloudformation-limits.html
 - https://learn.microsoft.com/en-us/azure/azure-resource-manager/templates/best-practices
 - https://learn.microsoft.com/en-us/azure/azure-resource-manager/bicep/deployment-stacks
+- https://kubernetes.io/releases/
+- https://kubernetes.io/blog/2025/12/17/kubernetes-v1-35-release/
+- https://kubernetes.io/docs/tasks/configure-pod-container/resize-container-resources/
+- https://kubernetes.io/docs/concepts/workloads/autoscaling/
+- https://kubernetes.io/docs/concepts/workloads/controllers/deployment/
+- https://kubernetes.io/docs/reference/networking/virtual-ips/
+- https://kubernetes.io/docs/concepts/services-networking/gateway/
+- https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/
+- https://aws.amazon.com/eks/pricing/
+- https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions.html
+- https://docs.aws.amazon.com/eks/latest/userguide/automode.html
+- https://learn.microsoft.com/en-us/azure/aks/free-standard-pricing-tiers
+- https://learn.microsoft.com/en-us/azure/aks/intro-aks-automatic
+- https://docs.aws.amazon.com/AmazonECS/latest/developerguide/deployment-type-blue-green.html
+- https://docs.aws.amazon.com/AmazonECS/latest/developerguide/deployment-types.html
+- https://learn.microsoft.com/en-us/azure/container-apps/revisions
+- https://learn.microsoft.com/en-us/azure/app-service/deploy-staging-slots
+- https://argoproj.github.io/argo-rollouts/

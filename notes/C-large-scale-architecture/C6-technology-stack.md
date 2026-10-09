@@ -13,6 +13,17 @@
   - Front Door (classic) retires 2027-03-31.
   - The SQS maximum message size is now 1 MiB.
   - S3 has had strong read-after-write consistency since Dec 2020.
+- **Datastores:** pick by access pattern and consistency need. RDBMS first: scale with pooling, cache, replicas, then sharding or distributed SQL. Go to NoSQL for known-pattern scale (DynamoDB/Cosmos DB, Cassandra, MongoDB), and model data query-first.
+- **Dynamo vs DynamoDB (say this explicitly):**
+  - The **2007 Dynamo paper** is leaderless: consistent hashing with vnodes, (N,R,W) sloppy quorum, hinted handoff, vector clocks, Merkle anti-entropy and gossip.
+  - **Managed DynamoDB is leader-per-partition**: 3 replicas in 3 AZs with **Multi-Paxos**, and writes are acked on 2/3 (USENIX ATC 2022).
+  - Cassandra keeps the Dynamo ring but uses last-write-wins timestamps instead of vector clocks.
+- **Bigtable lineage:** a sorted map keyed by (row, column family:qualifier, timestamp), with tablets, LSM storage (memtable → SSTable → compaction) and Chubby. HBase is the open-source copy. Cloud Bigtable nodes are stateless over Colossus.
+- **Search and logs:**
+  - Shippers (Fluent Bit) → a Kafka buffer → Logstash → Elasticsearch/OpenSearch.
+  - Size shards at 10–50 GB and < 200M docs. The primary shard count is fixed when the index is created.
+  - Elasticsearch licensing went Apache 2.0 → SSPL/ELv2 (2021) → AGPLv3 added (2024). OpenSearch is the Apache 2.0 fork.
+- **Big data:** HDFS (NameNode in RAM, 128 MB blocks, RF 3) → MapReduce (disk between stages) → Spark (DAG of stages split at shuffles, AQE; 4.x has ANSI on by default) → streaming (event time, watermarks, checkpointed state). Kinesis Data Analytics for SQL is gone (apps deleted from 2026-01-27). Azure MongoDB vCore is now **Azure DocumentDB**.
 
 ## C6.1 Web applications
 - **How it works:** The classic tiers are **client → (CDN) → L4/L7 LB → web server / reverse proxy → app server → cache / DB / queue**.
@@ -513,7 +524,320 @@ flowchart LR
   - "Service Bus vs Event Hubs?" Service Bus carries *commands/messages* with transactional semantics. Event Hubs carries *telemetry/event streams* at high volume.
   - Visibility-timeout / lock-duration tuning plus idempotent consumers is the universal at-least-once recipe.
 
-<!-- PART2-IDS-GO-HERE -->
+## C6.27 Datastores
+- **Categories, and what each is optimised for:**
+  - **Relational** (PostgreSQL, MySQL, SQL Server, Oracle): normalised schema, joins, ACID, ad-hoc SQL.
+  - **Key-value** (DynamoDB, Redis, Riak): O(1) access by key, horizontal scale, a narrow query model.
+  - **Wide-column** (Bigtable, HBase, Cassandra): sparse rows sorted by key, huge write throughput, time series.
+  - **Document** (MongoDB, Couchbase, Cosmos DB): JSON/BSON aggregates, a flexible schema, secondary indexes.
+  - **Search** (Elasticsearch/OpenSearch): inverted index for full-text, faceting and log analytics.
+  - **Graph** (Neo4j, Neptune, Cosmos DB Gremlin), **time-series** (Timestream, InfluxDB, ADX), **vector** (see [K2](../K-ai-infra-llm/K2-embeddings-vector-databases.md)), **object/blob** (S3/Blob, C6.14).
+- **Core distinction:** OLTP (many small, latency-bound reads and writes) vs OLAP (scans and aggregates over columnar data). See [M7](../M-data-platforms/M7-data-warehouses.md).
+- **Interview angle:** start from the **access patterns, consistency need, scale and latency SLO**, then pick the store. "Polyglot persistence" is fine, but every extra store adds ops cost, consistency gaps (dual writes, so use CDC/outbox) and an extra on-call surface.
+
+## C6.28 Datastore solutions
+| Requirement | Default pick | Why |
+|---|---|---|
+| Transactions, joins, < a few TB | PostgreSQL/MySQL (RDS/Aurora ↔ Azure Database for PostgreSQL/MySQL, Azure SQL) | ACID, mature tooling |
+| Relational at global scale | Spanner, CockroachDB, YugabyteDB, **Aurora DSQL** | Distributed SQL, consensus replication |
+| Key-value, unbounded scale, single-digit ms | **DynamoDB** ↔ **Cosmos DB for NoSQL** | Partitioned, serverless |
+| Write-heavy time series or wide rows | **Cassandra**, Bigtable, HBase | LSM storage, ordered within a partition |
+| Flexible JSON aggregates | **MongoDB** (Atlas), Amazon DocumentDB ↔ Azure DocumentDB | Document model, rich queries |
+| Full-text, log search | **Elasticsearch/OpenSearch** | Inverted index |
+| Analytics over TB–PB | Lakehouse (Delta/Iceberg) + Spark, or a warehouse | Columnar, MPP |
+- **Selection checklist:** query patterns (key lookup, range, ad-hoc), consistency (strong, bounded, eventual), multi-region writes, item/row size, hot-key risk, secondary indexes, backup/PITR, cost model (provisioned vs per-request), licence (SSPL/BSL/AGPL vs Apache).
+- **Pitfall:** choosing NoSQL "for scale" while the data is relational and fits on one Postgres node with replicas. Most systems never outgrow a well-tuned RDBMS.
+
+## C6.29 RDBMS
+- **How it works:**
+  - The storage engine keeps **B+tree** indexes and heap or clustered tables in pages (8 KB in Postgres, 16 KB in InnoDB). A **WAL / redo log** gives durability: commit means the log record is flushed to disk.
+  - **MVCC** means readers don't block writers (Postgres keeps old tuple versions plus VACUUM; InnoDB uses undo logs).
+  - Isolation defaults: Postgres **Read Committed**, MySQL InnoDB **Repeatable Read**, SQL Server Read Committed (RCSI is the Azure SQL Database default).
+- **Strengths:** ACID, constraints, joins, a cost-based optimiser, and decades of tooling.
+- **Limits:** a single writer node, so write scale is vertical; schema migrations on huge tables; connection-heavy models (Postgres uses a process per connection).
+- **Interview angles:** see [B1 ACID](../B-database-engineering/B1-acid.md), [B2 internals](../B-database-engineering/B2-database-internals.md), [B7 concurrency](../B-database-engineering/B7-concurrency-control.md). A common follow-up is "why is Postgres slow at 5,000 connections?" Answer: process per connection, so use PgBouncer (transaction pooling) or RDS Proxy.
+
+## C6.30 RDBMS scalability architecture
+- **Ladder, from cheapest to hardest:**
+  1. Tune indexes and queries.
+  2. Scale vertically.
+  3. Add **connection pooling** (PgBouncer, RDS Proxy, Azure's built-in PgBouncer).
+  4. Put a **cache** in front (C6.20).
+  5. Add **read replicas** (async, so reads lag. Handle read-your-writes by routing to the primary after a write or by checking the LSN).
+  6. **Functional partitioning** (a separate DB per service).
+  7. **Horizontal sharding** (Vitess, Citus, app-level) or **distributed SQL**.
+- **Cloud-native storage split:**
+  - **Aurora** keeps 6 copies across 3 AZs, with a **4/6 write quorum and 3/6 read quorum**. The log is the database, and up to 15 replicas share one storage volume.
+  - **Aurora Limitless Database** (sharded PostgreSQL) and **Aurora DSQL** (distributed, active-active) are the AWS options.
+  - On Azure, **Azure SQL Hyperscale** (page servers + log service, up to 128 TB, named replicas) and **Azure Database for PostgreSQL elastic clusters** (Citus).
+- **Sharding costs:** cross-shard joins and transactions, resharding, hot shards, and global uniqueness (Snowflake IDs). See [B5](../B-database-engineering/B5-database-partitioning.md), [B6](../B-database-engineering/B6-database-sharding.md), [B8 replication](../B-database-engineering/B8-database-replication.md), C2.18–C2.20.
+- **Interview angle:** "Scale writes 10×." First batch and queue writes, separate hot tables, and partition by tenant. Shard last, and pick the shard key on the dominant access path (tenant_id, user_id).
+
+## C6.31 NoSQL objectives & trade-offs
+- **Objectives:** horizontal scale on commodity nodes, high availability across failures, a flexible schema, and predictable latency at scale.
+- **The trade-offs you pay:**
+  - Weaker or tunable consistency (BASE). Note that **PACELC** is more useful than CAP: even without a partition, you trade latency against consistency.
+  - Limited joins and transactions. Most stores offer only single-item or single-partition atomicity. DynamoDB/MongoDB transactions exist but cost more.
+  - **Query-first data modelling**: denormalise and duplicate per access pattern (single-table design in DynamoDB, one table per query in Cassandra).
+  - Secondary indexes are either local (scatter-gather reads) or global (async, eventually consistent).
+- **LSM-tree vs B-tree:** most write-optimised NoSQL stores (Cassandra, HBase, Bigtable, RocksDB) use **LSM trees**: memtable → immutable SSTables → compaction. Writes are sequential and cheap. Reads may touch many SSTables (Bloom filters help). **Write and space amplification** come from compaction. See [B4](../B-database-engineering/B4-btree-vs-bplustree.md).
+- **Interview angle:** name the consistency model and the conflict-resolution strategy explicitly (LWW, vector clocks, CRDTs, single leader per partition). "Eventually consistent" alone is not an answer.
+
+## C6.32 Leaderless key-value store (Dynamo model) †
+> **Caveat (must say in an interview):** this is the model in the **2007 Dynamo paper** (Amazon's internal shopping-cart store). It inspired Cassandra, Riak and Voldemort. **Managed Amazon DynamoDB is *not* leaderless.** Per the 2022 USENIX ATC paper, each partition is a **replication group of 3 replicas across 3 AZs** that uses **Multi-Paxos** for leader election and consensus. Only the **leader** (which holds a renewable lease) serves writes and strongly consistent reads. A write is acked once **2 of 3** replicas persist the WAL record. Eventually consistent reads can go to any replica. **Log replicas** (WAL-only, Paxos-acceptor-like) are added to restore the write quorum quickly.
+- **Paper goals:** "always writeable" (an add-to-cart must never fail), 99.9th-percentile latency SLOs (about 300 ms), incremental scale, symmetric peers with no master.
+- **Tunable quorum (N, R, W):** each key is stored on N nodes (its **preference list**). A write succeeds on W acks and a read on R responses. A typical setting is (3, 2, 2). R + W > N gives quorum overlap, though with sloppy quorums that is *not* a linearizability guarantee.
+- **Sloppy quorum + hinted handoff:** if a preference-list node is down, the write goes to the next healthy node on the ring with a **hint**. That node delivers the write back when the owner recovers. Availability wins over strict quorum membership.
+- **Versioning:** **vector clocks** detect concurrent writes. Conflicting siblings are returned to the client for **semantic reconciliation** (merge cart items, which is why deleted items can reappear). Clocks are truncated past a size threshold.
+- **Repair:**
+  - **Read repair** fixes stale replicas seen during a read.
+  - **Merkle-tree anti-entropy** per key range compares hash trees, so only the differing ranges get transferred.
+- **Interview angles:**
+  - "Is DynamoDB leaderless?" → **No.** The 2007 Dynamo paper is leaderless; DynamoDB (2012+) uses leader-per-partition Multi-Paxos. **Global tables** are multi-active across regions with **last-writer-wins** (MREC), and **multi-Region strong consistency (MRSC)** is available (GA 2025, unverified exact date).
+  - Leaderless vs leader-based: leaderless gives write availability during failures, at the cost of conflicts and read repair. A leader per partition gives simple strong reads, at the cost of a failover window (the new leader waits out the old lease, a couple of seconds per the paper).
+
+## C6.33 Dynamo architecture: consistent hashing and gossip †
+> Same caveat as C6.32: this is the paper's design. DynamoDB uses a partition-metadata service and request routers instead of client-visible ring gossip, and adds **global admission control** and adaptive/burst capacity for hot partitions.
+- **Consistent hashing:** MD5 of the key → position on a 128-bit ring. Each physical node owns many **virtual nodes (tokens)**, which spreads load, lets heterogeneous hardware take proportional share, and spreads re-replication when a node fails. The paper's final scheme uses **Q equal-sized partitions** with tokens assigned to nodes, which makes bootstrapping and Merkle trees per range simpler. See [B6.2](../B-database-engineering/B6-database-sharding.md) and D1.21.
+- **Coordinator:** any node can coordinate. Usually it's the first healthy node in the key's preference list (partition-aware client or via the LB).
+- **Membership and failure detection:**
+  - **Gossip**: every second each node exchanges membership/token maps with a random peer. Changes converge in O(log n) rounds.
+  - **Seed nodes** prevent logical partitions of the ring.
+  - Membership changes are explicit admin operations. Transient failures are handled with local, per-request failure detection plus hinted handoff.
+- **Cassandra inherited this:** token ring + vnodes (`num_tokens` defaults to 16 since 4.0), gossip, the **phi-accrual failure detector**, snitches for rack/DC awareness, hinted handoff and Merkle repair. **Unlike Dynamo**, Cassandra uses **last-write-wins timestamps**, not vector clocks.
+- **Interview angle:** "Adding a node to a ring" → it takes over token ranges from its neighbours, streams those ranges, and only about 1/n of keys move (vs mod-N hashing, which remaps almost everything).
+
+```mermaid
+flowchart LR
+  C["Client put(cart:42)"] --> CO["Coordinator = first healthy node in preference list"]
+  subgraph RING["Consistent-hash ring, N=3, W=2"]
+    A["Node A (token range owner)"]
+    B["Node B (replica 2)"]
+    X["Node C (replica 3, DOWN)"]
+    D["Node D (next healthy on ring)"]
+  end
+  CO --> A
+  CO --> B
+  CO -. "sloppy quorum: write with hint for C" .-> D
+  D -. "hinted handoff when C recovers" .-> X
+  A <-. "gossip membership 1/s" .-> B
+  A <-. "Merkle-tree anti-entropy per key range" .-> X
+  NOTE["Managed DynamoDB today: per partition 3 replicas in 3 AZs, Multi-Paxos leader, 2 of 3 WAL acks"]
+```
+
+## C6.34 BigTable wide-column model †
+- **Data model (OSDI 2006 paper):** a sparse, distributed, persistent, **sorted map** `(row key, column family:qualifier, timestamp) → uninterpreted bytes`.
+  - Rows are sorted **lexicographically by row key**, so row-key design *is* the index and the partitioning.
+  - **Column families** are declared up front, few in number, and are the unit of access control and storage (locality groups). Qualifiers are unlimited and dynamic.
+  - **Timestamps** keep multiple versions, with GC policies of "keep last N" or "keep newer than T".
+  - **Atomicity is per row only.** There are no multi-row transactions (Cloud Bigtable adds single-row read-modify-write and conditional mutations).
+- **Row-key design:** avoid monotonically increasing keys (timestamps at the front cause a hot tablet). Use field promotion (`device#reverse_ts`), salting/hashing, and reversed domains (`com.example.www`) for locality.
+- **Cloud Bigtable (managed):** HBase-compatible API, **GoogleSQL queries supported**. Single-cluster instances are strongly consistent. Multi-cluster replication is **eventually consistent** by default (read-your-writes or strong via app-profile routing).
+- **Cloud mapping:** no exact AWS/Azure twin. The closest are **Keyspaces / DynamoDB** (AWS), **Cosmos DB for NoSQL / for Apache Cassandra** (Azure), or HBase on EMR/HDInsight.
+
+## C6.35 BigTable architecture
+- **Components:**
+  - A **master** assigns tablets to tablet servers, balances load, and handles schema changes. Clients rarely talk to it.
+  - **Tablet servers** serve reads and writes for about 10–1000 tablets each. A tablet is a contiguous row range (~100–200 MB in the paper) and is split when it grows.
+  - **Chubby** (a Paxos-based lock service) handles master election, tablet-server liveness (via locks), the schema, and the root of the location hierarchy.
+  - **GFS** (now **Colossus**) stores the SSTables and the commit log.
+- **Tablet location, a 3 level B+tree-like lookup:** Chubby file → **root tablet** → **METADATA tablets** → user tablet. Clients cache locations.
+- **Write/read path:**
+  - A write goes to the commit log (shared per server), then the **memtable**.
+  - **Minor compaction** flushes the memtable to an immutable **SSTable**. **Merging compaction** combines SSTables. **Major compaction** rewrites everything into one SSTable and drops deletion markers.
+  - A read merges the memtable and the SSTables. **Bloom filters** and the block cache cut disk seeks.
+- **Cloud Bigtable:** nodes **don't store data**. They hold pointers to tablets on Colossus, so rebalancing and node failure move only metadata (fast), and capacity scales by adding nodes.
+- **Interview angle:** compute–storage separation is why Bigtable, Spanner and Aurora scale and recover quickly. Compare HBase (C6.36), where RegionServers hold leases on regions but the data is also on shared HDFS.
+
+## C6.36 HBase
+- **What it is:** the open-source Bigtable on Hadoop.
+  - HMaster ↔ master, **RegionServer** ↔ tablet server, **region** ↔ tablet.
+  - **ZooKeeper** ↔ Chubby, **HDFS** ↔ GFS, **HFile** ↔ SSTable, **MemStore** ↔ memtable, **WAL** ↔ commit log, `hbase:meta` ↔ METADATA.
+- **Consistency:** **strongly consistent per row**, because each region is served by exactly one RegionServer. A RegionServer crash means a **failover gap**: ZK session timeout, WAL split/replay, then reassignment, which takes tens of seconds unless you enable region replicas (timeline-consistent reads).
+- **Fit:** random read/write over very large sparse tables in a Hadoop estate. **Phoenix** adds a SQL layer and secondary indexes.
+- **Pitfalls:** hot regions from sequential keys (pre-split, salt), compaction storms, JVM GC pauses, and ZK/HDFS dependencies that are all ops burden.
+- **Managed:** HBase on **EMR** (can store on S3) ↔ **HDInsight HBase** (on 5.1, see the HDInsight note in Cloud mapping). New designs usually pick Bigtable, DynamoDB/Keyspaces or Cosmos DB instead.
+
+## C6.37 Cassandra
+- **Architecture:** Dynamo-style distribution (token ring, vnodes, gossip, leaderless, hinted handoff) combined with a Bigtable-style storage engine (commit log → memtable → SSTables + compaction). Any node is a coordinator.
+- **Data model (CQL):** `PRIMARY KEY ((partition key), clustering columns)`. The partition key picks the token/replicas. Clustering columns sort rows *within* a partition. Model **one table per query**.
+- **Replication:** `NetworkTopologyStrategy` with an RF per DC (typically 3). Rack awareness comes from the snitch.
+- **Releases (verified):** **5.0.x** is current GA (5.0.9, Aug 2026). 4.1.x and 4.0.x are still maintained. 6.0 is not yet released per the download page.
+- **Pitfalls:**
+  - Large partitions (aim for < 100 MB / < 100k rows, unverified rule of thumb). Bucket by time.
+  - **Tombstones**: deletes and TTLs leave markers until `gc_grace_seconds` (default **10 days**). Too many tombstones make reads slow or fail. You **must run repair within gc_grace**, or deleted data resurrects.
+  - `ALLOW FILTERING` and secondary-index scans on high-cardinality data.
+- **Interview angle:** Cassandra suits write-heavy, multi-DC, always-on workloads with known query patterns (IoT, messaging, time series). It is a bad fit for ad-hoc queries, joins and frequent updates to the same row.
+
+## C6.38 Cassandra features
+- **Tunable consistency per request:** `ONE`, `QUORUM`, `LOCAL_QUORUM`, `EACH_QUORUM`, `ALL`, `ANY` (writes only). Strong reads need **R + W > RF**, for example LOCAL_QUORUM + LOCAL_QUORUM with RF=3. Multi-DC apps usually use LOCAL_QUORUM so they don't pay WAN latency.
+- **Conflict resolution:** **last-write-wins** by cell timestamp, so clock skew matters (use NTP). There are no vector clocks.
+- **Lightweight transactions (LWT):** `INSERT ... IF NOT EXISTS` and `UPDATE ... IF col = x` use **Paxos** at `SERIAL`/`LOCAL_SERIAL`. They cost about 4 round trips (Paxos v2 in 4.1 cuts this), so use them sparingly. **Accord** (CEP-15, general multi-partition ACID transactions) is targeted at a future major release (unverified timing).
+- **Repair and anti-entropy:** hinted handoff (`max_hint_window` default 3 h), read repair, and **`nodetool repair`** (Merkle trees; incremental or full). Tools like Reaper automate it.
+- **Compaction:** STCS (write-heavy), LCS (read-heavy), TWCS (TTL'd time series), and **UCS** (Unified Compaction Strategy, new in 5.0).
+- **5.0 headline features (verified):** **Storage-Attached Indexes (SAI)**, which are usable secondary indexes on multiple columns; **trie memtables and trie SSTables**; a **vector type + ANN search** (on SAI); **dynamic data masking**; and **JDK 17**.
+- **Interview angle:** "Make Cassandra strongly consistent" → QUORUM reads and writes give read-your-writes for a single key, but not linearizable compare-and-set. For that you need LWT (SERIAL), and even then it's per partition only.
+
+## C6.39 MongoDB
+- **Model:** BSON documents (max **16 MB**) in collections, a flexible schema with optional JSON-schema validation, rich queries, the aggregation pipeline, and secondary, compound, multikey, text, geo, TTL and wildcard indexes. **Atlas Search / Vector Search** run on Lucene-based `mongot`.
+- **Transactions:** single-document ops are atomic. Multi-document ACID transactions have existed since 4.0 (replica sets) and 4.2 (sharded), with a 60 s default lifetime. Model to avoid them: embed what's read together.
+- **Versions:** the release-notes page lists **9.0** as the current stable release, with 8.3, 8.0 and 7.0 as earlier versions (verify dates). Licence is **SSPL** since Oct 2018, which is why AWS/Azure offer *compatible* engines rather than MongoDB itself.
+- **Interview angles:**
+  - Embed vs reference: embed bounded 1:few data that is read together. Reference unbounded or shared data.
+  - The unbounded-array anti-pattern pushes documents toward the 16 MB limit and turns updates into large rewrites.
+
+## C6.40 MongoDB architecture
+- **Replica set:**
+  - One **primary** plus secondaries (up to 50 members, 7 voting). Raft-like election (protocol version 1). `electionTimeoutMillis` defaults to **10 s**.
+  - The **oplog** is an idempotent, capped operation log that secondaries tail.
+  - **Write concern** `w:"majority"` has been the default since 5.0, with journaled writes. Read concern can be `local`, `majority`, `linearizable` or `snapshot`. Read preference can be `primary`, `secondaryPreferred` or `nearest`, among others.
+  - **Causal consistency** sessions give read-your-writes against secondaries.
+- **Sharding:**
+  - **mongos** routers, a **config server replica set (CSRS)**, and shards that are each a replica set.
+  - **Shard key** can be ranged or hashed. Data is split into chunks (ranges, default 128 MB since 6.0), and the **balancer** migrates them.
+  - **`reshardCollection`** (5.0+) changes the shard key online.
+  - A query without the shard key is **scatter-gather** to every shard.
+- **Storage engine: WiredTiger:**
+  - Document-level concurrency (MVCC), compression (snappy by default, zstd optional), and B-tree storage.
+  - Internal cache = max(**50% of (RAM − 1 GB)**, 256 MB), with the OS page cache on top.
+  - **Checkpoints every 60 s**, plus a journal (WAL) for durability between checkpoints.
+- **Interview angle:** the shard key is close to permanent and drives everything. Use high cardinality, low frequency, a non-monotonic key that matches the dominant query (e.g. `{tenantId:1, _id:1}`). A monotonic `_id`/timestamp key makes one hot shard.
+
+## C6.41 Analytics
+- **Purpose:** turning operational data, events and logs into insight. Batch (hours), interactive (seconds) and real-time (sub-second to seconds).
+- **Architectures:**
+  - **Lambda**: a batch layer for correctness plus a speed layer for freshness. Two code paths.
+  - **Kappa**: a single streaming path, with reprocessing by replaying the log.
+  - **Lakehouse**: open table formats (Delta/Iceberg/Hudi) on object storage with ACID, plus Spark/SQL engines. See [M1](../M-data-platforms/M1-lakehouse-table-formats.md).
+- **Two families in this course:** the **log/search analytics** stack (ELK/EFK: shipper → Logstash/Fluentd → Elasticsearch → Kibana) and the **big-data** stack (HDFS → MapReduce → Spark, then streaming).
+- **Interview angle:** separate OLTP from analytics. Use CDC (Debezium, DMS, Fabric mirroring) into the lake or warehouse, and don't run heavy analytics on the primary DB.
+
+## C6.42 Analytics solutions
+| Need | OSS | AWS | Azure |
+|---|---|---|---|
+| Log collection/shipping | Fluent Bit, Fluentd, Logstash, Vector, OTel Collector | CloudWatch agent, **Amazon Data Firehose** (renamed from Kinesis Data Firehose) | **Azure Monitor Agent + DCRs**, Logs ingestion API |
+| Log search/analytics | Elasticsearch, OpenSearch, Loki | **OpenSearch Service** (managed + Serverless), CloudWatch Logs Insights | **Log Analytics (KQL)**, Azure Data Explorer, Elastic Cloud on Azure (ISV) |
+| Batch big data | Hadoop, Spark, Trino | **EMR** (EC2/EKS/Serverless), Glue, Athena | **Azure Databricks**, **Fabric** (Spark), HDInsight, Synapse |
+| Stream processing | Flink, Spark Structured Streaming, Kafka Streams | **Managed Service for Apache Flink** | **Stream Analytics**, Fabric Real-Time Intelligence, Databricks |
+| Warehouse | ClickHouse, Druid, Pinot | Redshift | Fabric Warehouse, Synapse dedicated SQL |
+- **Interview angle:** the logs pipeline needs a **buffer** (Kafka/Kinesis/Event Hubs) between shippers and indexers, so that indexing back-pressure or an outage doesn't drop logs or OOM the agents.
+
+## C6.43 Logstash architecture
+- **Pipeline:** **inputs → filters → outputs** in a JVM process.
+  - Inputs: beats, kafka, file, http, syslog, jdbc. Filters: grok, dissect, mutate, date, geoip, json, ruby. Outputs: elasticsearch, kafka, s3, among others.
+  - Events flow through **pipeline workers**. `pipeline.workers` defaults to the number of CPU cores, `pipeline.batch.size` to 125, and `pipeline.batch.delay` to 50 ms.
+- **Queues:** the default is **in-memory** (bounded, lost on crash). A **persistent queue** (`queue.type: persisted`, a disk-backed page file) gives at-least-once delivery and absorbs bursts. A **dead letter queue** captures events rejected by the Elasticsearch output (mapping errors).
+- **Multiple pipelines** (`pipelines.yml`) and **pipeline-to-pipeline** communication handle isolation and distributor/collector patterns.
+- **Trade-offs:** powerful parsing, but heavy (JVM, hundreds of MB). Keep it off the edge. Run lightweight shippers (Beats, Elastic Agent, Fluent Bit) on hosts and centralise Logstash. Elastic's **ingest pipelines** in Elasticsearch can replace Logstash for simple parsing.
+- **Pitfall:** greedy grok patterns cause CPU blowups. Prefer `dissect` for fixed formats and anchor regexes.
+
+## C6.44 Logstash data streaming architecture
+- **Reference flow:** Beats/Elastic Agent/Fluent Bit on hosts → **Kafka** (buffer, replay, fan-out) → Logstash consumer group (parse, enrich) → Elasticsearch/OpenSearch (data streams + ILM) → Kibana/Dashboards. Archive to S3/Blob in parallel.
+- **Why Kafka in the middle:**
+  - It decouples ingest rate from index rate.
+  - It survives an Elasticsearch outage for as long as the retention lasts.
+  - Several consumers (SIEM, lake, alerting) can read the same stream.
+  - Logstash instances scale horizontally as a consumer group, so parallelism is bounded by partitions.
+- **Delivery semantics:** end to end it is **at-least-once**. Use a deterministic document `_id` (a hash of the event) for idempotent indexing if duplicates matter.
+- **Interview angle:** size by events/s × average event size × retention × (1 + replicas) for Elasticsearch storage, plus Kafka retention for the outage window you need to cover.
+
+## C6.45 Fluentd
+- **Fluentd** (Ruby + C, CNCF **graduated**) uses tag-based routing. Sources → filters/parsers → `<match>` outputs, with **buffer** plugins (memory or file, chunked, retry with backoff). It has 1,000+ external plugins and a memory footprint of > 60 MB.
+- **Fluent Bit** (C, CNCF graduated as part of the Fluentd project) is about **450 KB**, has 100+ built-in plugins and native **OTLP** in/out. It is the de facto **Kubernetes DaemonSet** log agent and is used by AWS (FireLens, Container Insights) and others.
+- **Pattern:** Fluent Bit per node (tail `/var/log/containers`, add K8s metadata) → optional Fluentd/Fluent Bit **aggregator** → Elasticsearch/OpenSearch, Loki, S3, Kafka, CloudWatch or Azure Monitor.
+- **EFK vs ELK:** in Kubernetes stacks, Fluentd/Fluent Bit replace Logstash (lighter, cloud-native). The **OpenTelemetry Collector** is converging on the same role for logs, metrics and traces.
+- **Pitfalls:** unbounded memory buffers (use filesystem buffering + `mem_buf_limit`), multiline stack traces (use a multiline parser), and back-pressure from a slow output stalling inputs.
+
+## C6.46 Elasticsearch
+- **What it is:** a distributed search and analytics engine on **Apache Lucene**, with a JSON REST API, a query DSL, aggregations, ES|QL and **vector search** (dense_vector, HNSW, quantisation). It is near-real-time: new documents become searchable after a **refresh**, every **1 s** by default.
+- **Inverted index:** term → postings list (doc IDs, frequencies, positions). Analyzers (tokenizer + filters) decide the terms. **BM25** is the default relevance model. **Doc values** (columnar, on-disk) power sorting and aggregations. `text` fields are analysed and `keyword` fields are exact.
+- **Licence history (verified):**
+  - Apache 2.0 until **2021**, when Elastic moved to **SSPL + Elastic License 2.0** (7.11).
+  - AWS forked 7.10.2 as **OpenSearch** (Apache 2.0), which moved to the Linux Foundation's OpenSearch Software Foundation in 2024 (unverified month).
+  - **Aug 2024:** Elastic added **AGPLv3** as a third option, so Elasticsearch is OSI open source again.
+  - **OpenSearch 3.x** is current (3.7.0, Jun 2026), roughly one minor every 8 weeks.
+- **Interview angles:**
+  - It is not a primary database: no transactions, and mapping changes need a reindex. Keep the source of truth elsewhere and index via CDC or a stream.
+  - Watch for **mapping explosion** from dynamic fields (`index.mapping.total_fields.limit` defaults to 1000).
+
+## C6.47 Elasticsearch architecture
+- **Cluster and node roles:** `master` (dedicated ×3 for quorum-based election, Zen2 since 7.0), `data_hot/warm/cold/frozen`, `ingest`, `ml`, and coordinating-only nodes.
+- **Index → shards:**
+  - Each **primary shard** is a Lucene index. Since 7.0 the default is **1 primary + 1 replica**.
+  - The primary count is fixed at creation (change it only by `_split`/`_shrink`/reindex). Replicas can change at any time.
+  - Routing is `shard = hash(_routing or _id) % number_of_primary_shards`.
+  - A replica is never on the same node as its primary.
+- **Write path:** the coordinating node routes to the primary. The primary writes the in-memory buffer + **translog**, then replicates to the in-sync copies before acking. A **refresh** (1 s) makes a new searchable segment. A **flush** does a Lucene commit and trims the translog. Background **merges** compact segments.
+- **Read path:** query-then-fetch. Every shard (primary or replica) returns its top-k doc IDs and scores, then the coordinator merges and fetches the documents.
+- **Sizing (Elastic guidance, verified):**
+  - **10–50 GB per shard** and **< 200M docs per shard**.
+  - At most 1,000 non-frozen shards per node.
+  - Master heap of at least 1 GB per 3,000 indices.
+  - Too many small shards is the classic cluster killer.
+- **Lifecycle:** **data streams** + **ILM** (rollover by size/age → warm → cold → **frozen on searchable snapshots** in S3/Blob → delete).
+- **Interview angles:**
+  - "Cluster is red" → at least one primary is unassigned. Check `_cluster/allocation/explain`.
+  - Yellow means replicas are unassigned (normal on a single node).
+  - Split-brain needs a master quorum; that's why you run 3 dedicated masters.
+
+## C6.48 Hadoop HDFS
+- **Architecture:**
+  - A **NameNode** keeps the whole namespace and block map **in RAM**, roughly 150 bytes per file/block object, which causes the **small-files problem**.
+  - **DataNodes** store **128 MB blocks** (the default `dfs.blocksize`), send heartbeats every 3 s, and send block reports.
+- **Replication:** the default factor is **3**. The rack-aware policy puts the first replica on the writer's node, and the second and third on two different nodes in **another rack**. Writes are **pipelined** DataNode → DataNode.
+- **Hadoop 3 erasure coding** (e.g. RS-6-3) cuts storage overhead from 200% to **50%**, at the cost of CPU and network for cold data.
+- **HA:** an active + standby NameNode share edits via **JournalNodes (QJM, quorum of 3+)**, with **ZKFC** + ZooKeeper for automatic failover. **Federation** splits the namespace across multiple NameNodes.
+- **Semantics:** write-once, append-only, high throughput and high latency. It is not POSIX, and there are no random writes.
+- **Cloud reality:** compute–storage separation replaced HDFS with **object storage**: S3 (via EMRFS/S3A) ↔ **ADLS Gen2** (Blob with a hierarchical namespace, ABFS driver, atomic directory renames). HDFS lingers for on-prem and for EMR/HDInsight scratch space.
+
+## C6.49 Map-Reduce
+- **Model:** `map(k1,v1) → list(k2,v2)` → **shuffle and sort** (group by k2, partitioned with `hash(k2) % R`) → `reduce(k2, list(v2)) → output`.
+  - A **combiner** does map-side pre-aggregation to cut shuffle bytes.
+  - A custom **partitioner** controls key placement and ordering.
+- **Runtime:** YARN (ResourceManager + NodeManagers + a per-job ApplicationMaster).
+  - **Data locality** schedules maps on the nodes that hold the HDFS blocks.
+  - **Speculative execution** handles stragglers.
+  - Failed tasks are re-run from the input, because they are deterministic.
+- **Costs:** every job materialises intermediate data to **local disk** and writes its output to HDFS. Multi-stage and iterative pipelines (ML, graph) chain many jobs, so there is lots of I/O. That is why Spark, Tez and Flink replaced it.
+- **Interview angles:**
+  - **Data skew** (one hot key sends a single reducer to the tail). Fix with salting or a two-phase aggregation.
+  - The shuffle is the expensive part in *every* distributed engine. Minimise the bytes shuffled.
+
+## C6.50 Apache Spark
+- **Architecture:**
+  - A **driver** builds the logical plan. **Catalyst** optimises it, and the result is a physical plan made of a **DAG of stages**. Stage boundaries are **shuffles** (wide dependencies). Narrow transformations pipeline within a stage.
+  - Each stage runs one task per partition on the **executors** (JVMs with cores and memory). The cluster manager is YARN, Kubernetes or Standalone.
+  - **Lazy evaluation:** transformations only build the plan, and actions trigger jobs.
+  - **Fault tolerance:** RDD **lineage** recomputes lost partitions. Shuffle files persist on executors or an external shuffle service.
+  - **Tungsten** gives off-heap binary rows and whole-stage codegen. **AQE** (on by default since 3.2) coalesces shuffle partitions, switches join strategies and splits skewed partitions at runtime.
+- **Versions (verified):**
+  - **4.0** (2025): **ANSI SQL mode on by default**, JDK 17 default and Scala 2.13, **Spark Connect** expansion (thin `pyspark-client`), the **VARIANT** type, SQL UDFs and pipe syntax, the Python Data Source API, and State API v2 for streaming.
+  - **4.2.0** is the latest (Jul 2026). 3.5.x still gets maintenance.
+- **Interview angles:**
+  - Broadcast-hash join for small tables (`spark.sql.autoBroadcastJoinThreshold` defaults to 10 MB) vs sort-merge join.
+  - `spark.sql.shuffle.partitions` defaults to 200, so tune it or let AQE handle it.
+  - Avoid `collect()` on big data. Cache only data that is reused.
+  - Small files hurt; use the table format's compaction. Deep dive in [M2 Spark at scale](../M-data-platforms/M2-spark-at-scale.md) and [M3 Databricks](../M-data-platforms/M3-databricks-platform.md).
+
+## C6.51 Stream processing
+- **Core concepts:**
+  - **Event time vs processing time.**
+  - **Windows**: tumbling, sliding/hopping, session.
+  - **Watermarks** bound lateness. Late events are dropped or sent to a side output.
+  - **Keyed state** lives in RocksDB/state stores and is checkpointed.
+  - **Exactly-once**: Flink uses aligned/unaligned checkpoint **barriers** (Chandy–Lamport style) plus transactional or idempotent sinks.
+- **Engines:**
+  - **Apache Flink**: true streaming, low latency, rich state and timers.
+  - **Spark Structured Streaming**: micro-batch by default, plus a continuous/real-time mode. It has the same DataFrame API as batch.
+  - **Kafka Streams**: a library with no cluster. State lives in changelog topics.
+  - **Managed**: Managed Service for Apache Flink ↔ Azure Stream Analytics / Fabric Real-Time Intelligence. Databricks and Confluent (Flink) run on both clouds.
+- **Retired service:** **Kinesis Data Analytics for SQL** was discontinued. No new applications after **2025-10-15**, and existing apps were deleted from **2026-01-27**. Migrate to Managed Service for Apache Flink (or Flink Studio).
+- **Back-pressure** propagates upstream (Flink credit-based flow control). Monitor consumer lag, checkpoint duration and size, and watermark skew.
+- **Interview angles:**
+  - "Exactly-once end to end?" Only with replayable sources (Kafka offsets in the checkpoint) **and** transactional or idempotent sinks. Otherwise it is at-least-once plus dedup.
+  - State-size growth: set TTLs on state.
+  - Rescaling needs savepoints and stable operator UIDs.
+  - Deep dive in [M5 Stream processing](../M-data-platforms/M5-stream-processing.md) and [M4 Kafka](../M-data-platforms/M4-kafka-at-scale.md).
 
 ## Diagrams
 
@@ -552,6 +876,53 @@ sequenceDiagram
   C1->>L: fetch from offset 42 (group A)
   C2->>L: fetch from offset 0 (group B, replay)
   Note over L: e1 retained until retention/compaction, independent offsets per group
+```
+
+### DynamoDB today: leader-based partition replication (contrast with the Dynamo ring in C6.33)
+```mermaid
+sequenceDiagram
+  participant RR as "Request router"
+  participant L as "Leader replica (AZ-a, lease)"
+  participant F1 as "Replica (AZ-b)"
+  participant F2 as "Replica or log replica (AZ-c)"
+  RR->>L: PutItem (partition from metadata)
+  L->>L: append WAL record
+  L->>F1: replicate WAL (Multi-Paxos)
+  L->>F2: replicate WAL
+  F1-->>L: persisted
+  L-->>RR: ack after 2 of 3 WAL persisted
+  RR->>F2: eventually consistent GetItem (any replica)
+  RR->>L: strongly consistent GetItem (leader only)
+```
+
+### Elasticsearch cluster: shards, replicas, write path
+```mermaid
+flowchart TB
+  CL["Client bulk index"] --> CO["Coordinating node: shard = hash(_id) % primaries"]
+  subgraph ES["Cluster (3 dedicated masters elect via quorum)"]
+    M["Master nodes x3: cluster state"]
+    N1["Data node 1: P0, R1"]
+    N2["Data node 2: P1, R2"]
+    N3["Data node 3: P2, R0"]
+  end
+  CO --> N1
+  N1 -->|"replicate to in-sync copy"| N3
+  N1 -. "buffer + translog, refresh 1s = new Lucene segment" .-> SEG[("Segments, merged in background")]
+  M -. "allocates shards, never P and R on same node" .-> N2
+  N3 -. "ILM: hot to warm to frozen" .-> SS[("Searchable snapshots on S3 / Blob")]
+```
+
+### Spark job: DAG split into stages at shuffles
+```mermaid
+flowchart LR
+  R["read parquet (scan)"] --> F["filter + select (narrow)"]
+  F --> X1{{"shuffle: groupBy key"}}
+  X1 --> A["aggregate (stage 2)"]
+  S["read dim table (small)"] --> B["broadcast"]
+  A --> J["broadcast hash join (no shuffle)"]
+  B --> J
+  J --> W["write Delta/Iceberg (action triggers job)"]
+  D["Driver: Catalyst plan, DAG scheduler, AQE"] -.-> X1
 ```
 
 ### Reverse proxy + cache request flow
@@ -599,6 +970,15 @@ sequenceDiagram
 | Event streaming (log) | **Kinesis Data Streams** | **Event Hubs** | Ordered, partitioned, retained telemetry | Kinesis shards have per-shard limits. Event Hubs uses TU/PU/CU units and speaks the Kafka protocol | Kafka, Redpanda, Pulsar |
 | Managed Kafka | **MSK** (Provisioned Standard/Express, Serverless) | **Event Hubs Kafka endpoint** (not real Kafka brokers) or Confluent Cloud on Azure (Marketplace) | Kafka API without ops | MSK is real Apache Kafka (KRaft). Event Hubs implements the protocol, so some admin APIs, compaction limits and Streams features differ | Confluent Cloud, Aiven, Strimzi on K8s |
 | MQTT / IoT ingest | IoT Core | Event Grid MQTT broker / IoT Hub | Device messaging | Event Grid MQTT supports MQTT v3.1.1/v5 with routing to Event Hubs | EMQX, HiveMQ |
+| Managed relational | RDS, **Aurora** (Limitless, DSQL) | Azure SQL Database (Hyperscale), Azure Database for PostgreSQL/MySQL Flexible Server (elastic clusters) | OLTP | Aurora storage has 6 copies across 3 AZs (4/6 write quorum). Hyperscale uses page servers + a log service, up to 128 TB | Spanner, CockroachDB, YugabyteDB |
+| Serverless key-value / document | **DynamoDB** (+ global tables MREC/MRSC) | **Cosmos DB for NoSQL** | Planet-scale KV, single-digit ms | DynamoDB is leader-per-partition Multi-Paxos with 2 consistency choices. Cosmos DB has 5 consistency levels and multi-region writes | ScyllaDB Alternator, Bigtable |
+| Cassandra-compatible | **Amazon Keyspaces** (serverless) | **Cosmos DB for Apache Cassandra** (API on the Cosmos engine) / **Azure Managed Instance for Apache Cassandra** (real OSS Cassandra up to 5.0) | Wide-column, CQL | Keyspaces: 3 AZ replicas, writes always LOCAL_QUORUM, reads ONE/LOCAL_ONE/LOCAL_QUORUM only (no QUORUM/ALL/SERIAL levels). Cosmos Cassandra API is wire-compatible but not Cassandra. MI runs real Cassandra in your VNet and supports hybrid rings | DataStax Astra, ScyllaDB, self-managed on K8s (K8ssandra) |
+| MongoDB-compatible | **Amazon DocumentDB** | **Azure DocumentDB** (formerly Cosmos DB for MongoDB vCore; built on the MIT-licensed DocumentDB engine on PostgreSQL) / Cosmos DB for MongoDB (RU) | Document store | Neither runs MongoDB server code (SSPL), so check compatibility per operator and feature | **MongoDB Atlas** (on AWS and Azure), FerretDB |
+| Wide-column (Bigtable/HBase) | HBase on EMR (S3 storage); Keyspaces/DynamoDB for new builds | HBase on HDInsight; Cosmos DB for new builds | Sorted sparse tables | No first-party Bigtable equivalent on either | Cloud Bigtable (GCP) |
+| Search / log analytics | **OpenSearch Service** (managed clusters + Serverless) | **Elastic Cloud on Azure** (Azure Native ISV service), **Azure AI Search** (app/RAG search, not log analytics), Log Analytics/ADX for logs | Full-text, logs, vectors | OpenSearch Service is OpenSearch (or legacy ES ≤ 7.10). Azure has no first-party managed Elasticsearch; AI Search is a different product with its own API | Elastic Cloud, self-hosted ECK/OpenSearch operator |
+| Hadoop / Spark platform | **EMR** (on EC2, EKS, Serverless), Glue | **Azure Databricks**, **Microsoft Fabric** (Spark), HDInsight 5.1 (Spark 3.3), Synapse Spark | Batch ETL, ML prep | HDInsight 4.0/5.0 retired 2025-03-31. 5.1 has no announced retirement but ships old Spark. HDInsight on AKS was retired (early 2025, unverified). New Azure designs use Databricks or Fabric | Databricks on AWS, Dataproc |
+| Stream processing | **Managed Service for Apache Flink** (KDA for SQL discontinued 2026-01-27) | **Azure Stream Analytics** (SQL, SU-based), Fabric Real-Time Intelligence / Eventstream | Windowed aggregation, CEP | MSF is real Flink (Java/Python/SQL). ASA is proprietary SQL on Trill with exactly-once for selected outputs | Confluent Cloud for Flink, Databricks Structured Streaming |
+| Log ingestion pipeline | CloudWatch agent → **CloudWatch Logs** (subscription filters) → **Amazon Data Firehose** → S3/OpenSearch/Splunk | **Azure Monitor Agent + Data Collection Rules** (KQL transforms) / **Logs ingestion API** → Log Analytics | Collect, transform, route logs | DCRs do ingestion-time KQL filtering/masking (cuts cost). Firehose does buffering + Lambda transforms + format conversion | Fluent Bit, OTel Collector, Vector, Cribl |
 
 - **Web hosting:**
   - Beanstalk is IaaS-shaped PaaS: you can SSH in and the resources live in your account.
@@ -627,6 +1007,20 @@ sequenceDiagram
   - Confluent Cloud (multi-cloud Kafka with Flink).
   - Strimzi or the RabbitMQ Cluster Operator on Kubernetes for portability.
   - Self-managed Valkey for licence-clean Redis.
+- **Datastores (C6.27–C6.40):**
+  - DynamoDB ↔ Cosmos DB for NoSQL is the canonical pair.
+  - **Cassandra** has two Azure answers. Use the *API* (Cosmos DB for Apache Cassandra) for serverless/RU economics and global distribution. Use **Managed Instance** when you need real Cassandra behaviour (repair, compaction tuning, hybrid rings over ExpressRoute).
+  - **Keyspaces** is serverless but restricts consistency levels and features. Test LWT, secondary indexes and TTL behaviour before migrating.
+  - **MongoDB:** both clouds offer compatible engines (Amazon DocumentDB, Azure DocumentDB). For full MongoDB features (latest server, Atlas Search/Vector Search), use **MongoDB Atlas**, available on both via marketplace.
+- **Search and logs (C6.41–C6.47):**
+  - AWS has first-party OpenSearch.
+  - Azure's first-party log store is **Log Analytics (KQL)**. Elasticsearch on Azure is Elastic's ISV service.
+  - Pick **Azure AI Search** for application/RAG search, not for log pipelines.
+  - Legacy Azure Log Analytics agent (MMA) is replaced by AMA + DCRs, and the HTTP Data Collector API by the Logs ingestion API.
+- **Big data (C6.48–C6.51):**
+  - S3 ↔ ADLS Gen2 replaces HDFS.
+  - EMR ↔ Databricks/Fabric is the practical modern pair. Treat HDInsight as legacy (5.1 only, Spark 3.3).
+  - Managed Flink ↔ Stream Analytics is the closest streaming pair, but ASA is not Flink. For portable Flink on Azure, use Confluent Cloud or Flink on AKS.
 
 ## Hands-on (optional)
 ```yaml
@@ -735,6 +1129,13 @@ resource "aws_elasticache_serverless_cache" "cache" {
 - [M4 Kafka at scale](../M-data-platforms/M4-kafka-at-scale.md) · [M5 Stream processing](../M-data-platforms/M5-stream-processing.md)
 - [K7 AI gateways, caching, cost](../K-ai-infra-llm/K7-ai-gateways-caching-cost.md)
 - [J5 Capacity planning and load testing](../J-sre/J5-capacity-planning-load-testing.md)
+- [B1 ACID](../B-database-engineering/B1-acid.md) · [B2 Database internals](../B-database-engineering/B2-database-internals.md) · [B4 B-tree vs B+tree](../B-database-engineering/B4-btree-vs-bplustree.md)
+- [B5 Partitioning](../B-database-engineering/B5-database-partitioning.md) · [B6 Sharding](../B-database-engineering/B6-database-sharding.md) · [B8 Replication](../B-database-engineering/B8-database-replication.md) · [B9 Database system design](../B-database-engineering/B9-database-system-design.md) · [B10 Database engines](../B-database-engineering/B10-database-engines.md)
+- [C2 Scalability: partitioning/sharding (C2.18–C2.20), replication (C2.10–C2.11)](../C-large-scale-architecture/C2-scalability.md)
+- [D1 System design basics: partitioning (D1.22)](../D-system-design/D1-system-design-basics.md)
+- [J3 Observability (log pipelines)](../J-sre/J3-observability.md)
+- [K2 Embeddings and vector databases](../K-ai-infra-llm/K2-embeddings-vector-databases.md)
+- [M1 Lakehouse table formats](../M-data-platforms/M1-lakehouse-table-formats.md) · [M2 Spark at scale](../M-data-platforms/M2-spark-at-scale.md) · [M3 Databricks](../M-data-platforms/M3-databricks-platform.md) · [M6 Orchestration/ETL](../M-data-platforms/M6-orchestration-etl.md) · [M7 Data warehouses](../M-data-platforms/M7-data-warehouses.md)
 
 ## Sources
 - https://httpd.apache.org/docs/2.4/mpm.html
@@ -760,3 +1161,26 @@ resource "aws_elasticache_serverless_cache" "cache" {
 - https://learn.microsoft.com/en-us/azure/storage/blobs/access-tiers-overview
 - https://learn.microsoft.com/en-us/azure/event-hubs/event-hubs-quotas
 - https://learn.microsoft.com/en-us/azure/service-bus-messaging/service-bus-quotas
+- https://www.usenix.org/conference/atc22/presentation/elhemali (Amazon DynamoDB, USENIX ATC 2022: Multi-Paxos replication groups, 2/3 write quorum, log replicas)
+- https://www.usenix.org/system/files/atc22-elhemali.pdf
+- https://cassandra.apache.org/_/download.html
+- https://cassandra.apache.org/doc/latest/cassandra/new/index.html
+- https://docs.aws.amazon.com/keyspaces/latest/devguide/what-is-keyspaces.html
+- https://docs.aws.amazon.com/keyspaces/latest/devguide/consistency.html
+- https://learn.microsoft.com/en-us/azure/managed-instance-apache-cassandra/introduction
+- https://learn.microsoft.com/en-us/azure/cosmos-db/cassandra/introduction
+- https://learn.microsoft.com/en-us/azure/documentdb/overview
+- https://www.mongodb.com/docs/manual/release-notes/
+- https://docs.cloud.google.com/bigtable/docs/overview
+- https://www.elastic.co/blog/elasticsearch-is-open-source-again
+- https://www.elastic.co/docs/deploy-manage/production-guidance/optimize-performance/size-shards
+- https://opensearch.org/releases/
+- https://docs.fluentbit.io/manual/about/fluentd-and-fluent-bit
+- https://spark.apache.org/news/index.html
+- https://spark.apache.org/releases/spark-release-4-0-0.html
+- https://docs.aws.amazon.com/managed-flink/latest/java/what-is.html
+- https://docs.aws.amazon.com/kinesisanalytics/latest/dev/discontinuation.html
+- https://learn.microsoft.com/en-us/azure/stream-analytics/stream-analytics-introduction
+- https://learn.microsoft.com/en-us/azure/hdinsight/hdinsight-component-versioning
+- https://learn.microsoft.com/en-us/azure/hdinsight/hdinsight-overview
+- https://learn.microsoft.com/en-us/azure/azure-monitor/data-collection/data-collection-rule-overview
