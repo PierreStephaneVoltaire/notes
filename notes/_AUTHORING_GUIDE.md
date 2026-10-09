@@ -61,6 +61,9 @@ then omit the heading entirely.)
 - Code is restricted to: **bash** (```bash), **Docker** (```dockerfile / docker compose ```yaml),
   **Terraform** (```hcl). NO Python, Go, JS, SQL-heavy programs, etc. (a one-line SQL statement
   shown inside a bash `psql -c` call is fine). Keep snippets short and correct.
+- Tool configuration counts as config, not code, and is allowed: CI pipeline YAML (GitHub Actions /
+  GitLab CI / Azure Pipelines), a short declarative Jenkinsfile, Prometheus/Alertmanager/OTel/Kubernetes
+  YAML, JSON policies.
 
 ## Cross-links
 - Relative markdown links to related subsection files, e.g.
@@ -69,7 +72,8 @@ then omit the heading entirely.)
   A-operating-systems, B-database-engineering, C-large-scale-architecture, D-system-design,
   E-ai-system-design, F-network-engineering, G-cloud-network-architecture,
   H-full-stack-troubleshooting, I-dns-tls-acceleration-gaps, J-sre, K-ai-infra-llm,
-  L-data-privacy-ai-security, M-data-platforms.
+  L-data-privacy-ai-security, M-data-platforms, N-cicd-platform-engineering, O-observability-tooling,
+  P-security-platforms-identity, Q-industry-domains, R-support-communication, ../languages/.
   If unsure of the exact target filename, link to the folder plus ID text, e.g. `../C-large-scale-architecture/ (C1.27)`.
 
 ## Sources
@@ -94,4 +98,10 @@ J-sre: J1-slis-slos-error-budgets.md, J2-monitoring-and-alerting.md, J3-observab
 K-ai-infra-llm: K1-llm-fundamentals-for-infra.md, K2-embeddings-vector-databases.md, K3-rag-pipelines.md, K4-llm-serving-inference.md, K5-training-fine-tuning.md, K6-managed-model-platforms.md, K7-ai-gateways-caching-cost.md, K8-agents-tool-use-mcp.md, K9-llmops-evals-guardrails.md
 L-data-privacy-ai-security: L1-data-classification-pii.md, L2-encryption-key-management.md, L3-residency-compliance.md, L4-ai-security-threats.md, L5-model-data-governance.md, L6-secrets-supply-chain.md, L7-zero-trust-workload-identity.md
 M-data-platforms: M1-lakehouse-table-formats.md, M2-spark-at-scale.md, M3-databricks-platform.md, M4-kafka-at-scale.md, M5-stream-processing.md, M6-orchestration-etl.md, M7-data-warehouses.md
+K-ai-infra-llm (added): K10-ml-fundamentals.md
+N-cicd-platform-engineering: N1-github-actions.md, N2-gitlab-ci-jenkins.md, N3-azure-devops-aws-codepipeline.md, N4-gitops-argocd-flux.md, N5-iac-pipelines-policy-as-code.md, N6-internal-developer-platforms.md, N7-openshift.md
+O-observability-tooling: O1-prometheus.md, O2-grafana-lgtm-stack.md, O3-elastic-stack.md, O4-datadog.md, O5-zabbix.md
+P-security-platforms-identity: P1-wiz-cnapp.md, P2-crowdstrike-edr-xdr.md, P3-soc2-iso-compliance-operations.md, P4-identity-providers.md
+Q-industry-domains: Q1-healthcare-interoperability.md, Q2-healthcare-cloud-hipaa-engineering.md, Q3-payment-processing-integration.md
+R-support-communication: R1-incident-communication.md, R2-ticket-handling-jira.md, R3-writing-for-audiences.md
 Anchor format: GitHub-style lowercase slug of the heading, e.g. "## C1.27 Caching for performance" → #c127-caching-for-performance
